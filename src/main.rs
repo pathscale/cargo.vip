@@ -46,7 +46,7 @@ const READ_TTL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `registryApi.IssueCredentials` in the registry's generated schema.
-const ISSUE_CREDENTIALS: u32 = 20010;
+const ISSUE_CREDENTIALS: u32 = 20030;
 
 #[derive(Parser)]
 #[command(
@@ -109,6 +109,7 @@ struct Args {
 /// them; setting them skips the broker entirely.
 #[derive(Deserialize, Default)]
 struct FileConfig {
+    broker: Option<String>,
     token: Option<String>,
     key_id: Option<String>,
     key_secret: Option<String>,
@@ -184,7 +185,7 @@ fn source(args: &Args, file: FileConfig) -> Result<Source> {
         }
         (None, None) => match file.token {
             Some(token) => Ok(Source::Broker {
-                url: args.broker.clone(),
+                url: file.broker.unwrap_or_else(|| args.broker.clone()),
                 token,
             }),
             None => bail!(
@@ -220,8 +221,14 @@ async fn login(broker: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    std::fs::write(&path, format!("token = \"{token}\"\n"))
-        .with_context(|| format!("writing {}", path.display()))?;
+    // The broker is stored with the token: a person should not have to repeat
+    // --broker on every build, and a token is only meaningful against the
+    // registry that issued it.
+    std::fs::write(
+        &path,
+        format!("token = \"{token}\"\nbroker = \"{broker}\"\n"),
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
 
     // The file holds a credential; other users on the machine should not read it.
     #[cfg(unix)]
