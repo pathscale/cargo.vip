@@ -23,6 +23,14 @@ credential.
 - **`config.json` is generated, never read from the bucket.** `dl` must name this
   process, and a loopback address written into the bucket would impose one machine's
   port on every consumer.
+- **The broker is the default; an explicit key is the override.** A person runs `cargo
+  vip login` and only a revocable registry token is persisted; the object-store key is
+  fetched per run and held in memory. Passing `--key-id`/`--key-secret` skips the broker
+  entirely, which is what keeps CI and non-crates.vip buckets working. Never persist a
+  key obtained from the broker.
+- **Tigris has no STS.** Access keys are long-lived, so fetching per run buys no expiry.
+  What it buys is that the long-lived key never reaches disk. Do not add an on-disk
+  cache for broker-issued keys.
 - **No publish path.** This is the read side. Publishing is two S3 writes a CI job does
   with the AWS CLI.
 

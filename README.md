@@ -35,17 +35,16 @@ There is no shared token and nothing to leak in a URL.
 
 ## Setup
 
-Put your credentials in `~/.config/cargo-vip/credentials.toml`:
+By default the tool holds **no object-store credential at all**:
 
-```toml
-key_id = "tid_…"
-key_secret = "tsec_…"
-bucket = "my-crates"
-# endpoint = "https://fly.storage.tigris.dev"   # default; any S3 store works
-# region = "auto"
+```sh
+cargo vip login
 ```
 
-Or pass them as `CARGO_VIP_KEY_ID`, `CARGO_VIP_KEY_SECRET`, `CARGO_VIP_BUCKET`.
+stores a token for the registry management API in
+`~/.config/cargo-vip/credentials.toml` (mode `0600`). Each run exchanges that
+token for a scoped access key, kept **in memory only** and never written to
+disk. Revoking the token at the registry ends access at the next build.
 
 Then depend on a private crate as usual:
 
@@ -65,6 +64,28 @@ cargo vip update
 The wrapper sets `CARGO_REGISTRIES_VIP_INDEX` for the child process only, so
 there is no `.cargo/config.toml` entry to add and nothing left behind when it
 exits.
+
+### Using a key directly
+
+CI, and any bucket with no broker in front of it, pass the key explicitly. This
+skips the broker entirely and never touches the network for credentials:
+
+```sh
+cargo vip --key-id "$KEY" --key-secret "$SECRET" --bucket my-crates build
+```
+
+or as `CARGO_VIP_KEY_ID`, `CARGO_VIP_KEY_SECRET`, `CARGO_VIP_BUCKET`, or in
+`~/.config/cargo-vip/credentials.toml`:
+
+```toml
+key_id = "tid_…"
+key_secret = "tsec_…"
+bucket = "my-crates"
+# endpoint = "https://fly.storage.tigris.dev"   # default; any S3 store works
+# region = "auto"
+```
+
+An explicit key always wins over the broker.
 
 ### Keeping it running instead
 

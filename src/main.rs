@@ -45,6 +45,9 @@ const READ_TTL: Duration = Duration::from_secs(60);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `registryApi.IssueCredentials` in the registry's generated schema.
+const ISSUE_CREDENTIALS: u32 = 20010;
+
 #[derive(Parser)]
 #[command(
     name = "cargo-vip",
@@ -72,6 +75,15 @@ struct Args {
     #[arg(long, env = "CARGO_VIP_BUCKET")]
     bucket: Option<String>,
 
+    /// Registry management API that issues credentials. The default flow is to
+    /// hold no object-store key at all: `cargo vip login` stores a token for
+    /// this service, and each run exchanges it for a scoped key held in memory.
+    #[arg(long, env = "CARGO_VIP_BROKER", default_value = "wss://api.crates.vip")]
+    broker: String,
+
+    /// Use this key directly and never contact the broker. Both halves must be
+    /// given. This is the CI path, and the path for any bucket that has no
+    /// broker in front of it.
     #[arg(long, env = "CARGO_VIP_KEY_ID", hide_env_values = true)]
     key_id: Option<String>,
 
@@ -89,15 +101,41 @@ struct Args {
     cargo_args: Vec<String>,
 }
 
-/// `~/.config/cargo-vip/credentials.toml`, so a key need not be pasted into a
-/// shell on every invocation.
+/// `~/.config/cargo-vip/credentials.toml`.
+///
+/// In the default flow this holds only `token` — a credential for the registry
+/// management API, which is revocable and is not an object-store key. The
+/// `key_id`/`key_secret` fields exist for buckets with no broker in front of
+/// them; setting them skips the broker entirely.
 #[derive(Deserialize, Default)]
 struct FileConfig {
+    token: Option<String>,
     key_id: Option<String>,
     key_secret: Option<String>,
     bucket: Option<String>,
     endpoint: Option<String>,
     region: Option<String>,
+}
+
+/// What the registry needs to be read, however it was obtained.
+struct Resolved {
+    key_id: String,
+    key_secret: String,
+    bucket: String,
+    endpoint: String,
+    region: String,
+}
+
+/// Where credentials come from.
+///
+/// Tigris has no STS: access keys are long-lived, so fetching per run buys no
+/// expiry. What it buys is that the long-lived key is never written to disk —
+/// the only thing persisted is the broker token, which the registry can revoke.
+enum Source {
+    /// Explicit key. Skips the broker.
+    Static(Resolved),
+    /// Exchange a token for a scoped key at each run.
+    Broker { url: String, token: String },
 }
 
 fn credentials_path() -> Option<PathBuf> {
@@ -116,6 +154,175 @@ fn load_file_config() -> Result<FileConfig> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileConfig::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+/// Decide where credentials come from.
+///
+/// An explicit key always wins, so CI and any bucket without a broker keep
+/// working and never touch the network for credentials. Otherwise the broker
+/// token is used, which is the default for a person.
+fn source(args: &Args, file: FileConfig) -> Result<Source> {
+    let key_id = args.key_id.clone().or(file.key_id);
+    let key_secret = args.key_secret.clone().or(file.key_secret);
+    let bucket = args.bucket.clone().or(file.bucket);
+
+    match (key_id, key_secret) {
+        (Some(key_id), Some(key_secret)) => {
+            let Some(bucket) = bucket else {
+                bail!("an explicit key needs --bucket or CARGO_VIP_BUCKET");
+            };
+            Ok(Source::Static(Resolved {
+                key_id,
+                key_secret,
+                bucket,
+                endpoint: file.endpoint.unwrap_or_else(|| args.endpoint.clone()),
+                region: file.region.unwrap_or_else(|| args.region.clone()),
+            }))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("--key-id and --key-secret must be given together")
+        }
+        (None, None) => match file.token {
+            Some(token) => Ok(Source::Broker {
+                url: args.broker.clone(),
+                token,
+            }),
+            None => bail!(
+                "not logged in: run `cargo vip login`, or pass --key-id/--key-secret \
+                 with --bucket to use a key directly"
+            ),
+        },
+    }
+}
+
+/// Store a token for the registry management API.
+///
+/// The token is what gets persisted; the object-store key never is. Revoking
+/// the token at the registry therefore ends access at the next build.
+async fn login(broker: &str) -> Result<()> {
+    let Some(path) = credentials_path() else {
+        bail!("cannot determine a config directory");
+    };
+
+    eprintln!("Paste your {broker} token (it is not echoed to the terminal):");
+    let mut token = String::new();
+    std::io::stdin()
+        .read_line(&mut token)
+        .context("reading the token")?;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("no token given");
+    }
+
+    // Verify before storing, so a typo fails here and not inside a build.
+    let resolved = issue_credentials(broker, token).await?;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&path, format!("token = \"{token}\"\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    // The file holds a credential; other users on the machine should not read it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
+    }
+
+    eprintln!("logged in; registry bucket {}", resolved.bucket);
+    Ok(())
+}
+
+/// Exchange a broker token for a scoped object-store key.
+///
+/// The registry's management surface is an endpoint-libs WebSocket: `Init`
+/// travels in `Sec-WebSocket-Protocol` at handshake time as
+/// `["0init", "1<token>"]`, and nothing else can be called until it resolves.
+/// That is a small enough wire contract to speak directly rather than take a
+/// dependency on the server's crate.
+async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    let mut request = broker
+        .into_client_request()
+        .with_context(|| format!("{broker} is not a valid WebSocket URL"))?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(&format!("0init, 1{token}"))
+            .context("the token is not valid in a header")?,
+    );
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .with_context(|| format!("connecting to {broker}"))?;
+
+    // The handshake reply carries the authenticated identity; a bad token
+    // fails here rather than on the call below.
+    let _init = next_json(&mut socket).await.context("registry handshake")?;
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({ "method": ISSUE_CREDENTIALS, "seq": 1, "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .context("requesting credentials")?;
+
+    let reply = next_json(&mut socket)
+        .await
+        .context("issuing credentials")?;
+    let params = reply.get("params").unwrap_or(&reply);
+
+    let field = |name: &str| -> Result<String> {
+        params
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("the registry did not return {name}: {reply}"))
+    };
+
+    Ok(Resolved {
+        key_id: field("keyId")?,
+        key_secret: field("keySecret")?,
+        bucket: field("bucket")?,
+        endpoint: field("endpoint")?,
+        region: field("region")?,
+    })
+}
+
+async fn next_json<S>(socket: &mut S) -> Result<serde_json::Value>
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    while let Some(message) = socket.next().await {
+        match message.context("reading from the registry")? {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).context("the registry sent invalid JSON")?;
+                if let Some(error) = value.get("error") {
+                    bail!("the registry refused: {error}");
+                }
+                return Ok(value);
+            }
+            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                bail!("the registry closed the connection: {frame:?}");
+            }
+            _ => {}
+        }
+    }
+    bail!("the registry closed the connection without replying")
 }
 
 struct Registry {
@@ -153,21 +360,21 @@ async fn main() -> Result<()> {
     let args = Args::parse_from(raw);
     let file = load_file_config()?;
 
-    let (Some(key_id), Some(key_secret)) = (
-        args.key_id.or(file.key_id),
-        args.key_secret.or(file.key_secret),
-    ) else {
-        bail!(
-            "no credentials: set CARGO_VIP_KEY_ID and CARGO_VIP_KEY_SECRET, or write them to {}",
-            credentials_path().unwrap_or_default().display()
-        );
-    };
-    let Some(bucket_name) = args.bucket.or(file.bucket) else {
-        bail!("no bucket: pass --bucket or set CARGO_VIP_BUCKET");
-    };
+    if args.cargo_args.first().is_some_and(|a| a == "login") {
+        return login(&args.broker).await;
+    }
 
-    let endpoint = file.endpoint.unwrap_or(args.endpoint);
-    let region = file.region.unwrap_or(args.region);
+    let resolved = match source(&args, file)? {
+        Source::Static(resolved) => resolved,
+        Source::Broker { url, token } => issue_credentials(&url, &token).await?,
+    };
+    let (key_id, key_secret, bucket_name, endpoint, region) = (
+        resolved.key_id,
+        resolved.key_secret,
+        resolved.bucket,
+        resolved.endpoint,
+        resolved.region,
+    );
 
     // Loopback only. The key lives in this process and nothing off the machine
     // should be able to borrow it.
