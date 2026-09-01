@@ -1,0 +1,50 @@
+[package]
+name = "cargo-vip"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Use a private S3-compatible bucket as a Cargo registry, without running a server"
+repository = "https://github.com/pathscale/cargo.vip"
+homepage = "https://cargo.vip"
+keywords = ["cargo", "registry", "s3", "private", "tigris"]
+categories = ["development-tools::cargo-plugins"]
+readme = "README.md"
+
+# Invoked as `cargo vip …`: cargo runs any `cargo-<name>` on PATH as a
+# subcommand.
+[[bin]]
+name = "cargo-vip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+rusty-s3 = "0.10.2"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+strip = true
+
+[lints.clippy.similar_names]
+level = "allow"
+priority = 0
+
+[lints.clippy.struct_field_names]
+level = "allow"
+priority = 0
