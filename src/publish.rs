@@ -94,12 +94,21 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
     let cksum = hex::encode(Sha256::digest(&tarball));
     let entry = package.index_entry(&cksum, &req.index_url)?;
 
+    tracing::info!("registry bucket {} (the token's app)", target.bucket.name());
     if req.dry_run {
         println!("{}", serde_json::to_string_pretty(&entry)?);
         tracing::info!("dry run: nothing written");
         return Ok(());
     }
 
+    // Said before anything is written, so a log shows where a publish went: the
+    // bucket of the app the token was minted in, and nowhere else.
+    tracing::info!(
+        "publishing {} {} to bucket {}",
+        package.name,
+        package.version,
+        target.bucket.name()
+    );
     let key = crate::Registry::crate_key(&package.name, &package.version, &cksum);
     let status = put(
         target,
