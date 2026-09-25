@@ -458,8 +458,16 @@ async fn main() -> Result<()> {
 
     // `--config` rather than `.cargo/config.toml`, so wrapping a build edits no
     // file and leaves nothing behind.
+    //
+    // Cargo does not forward `--config` to an external subcommand such as
+    // `cargo clippy`, and source replacement cannot be set from the
+    // environment. So the index is also pointed straight at the loopback
+    // through the environment, which `--config` outranks for built-in
+    // commands; only an external one sees it, and its lockfile then names the
+    // loopback.
     let status =
         tokio::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .env(index_env(&args.registry), &loopback)
             .args(&config)
             .args(&args.cargo_args)
             .status()
@@ -468,6 +476,14 @@ async fn main() -> Result<()> {
 
     serving.abort();
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The environment variable that sets `registries.<registry>.index`.
+fn index_env(registry: &str) -> String {
+    format!(
+        "CARGO_REGISTRIES_{}_INDEX",
+        registry.to_uppercase().replace('-', "_")
+    )
 }
 
 /// The `--config` arguments that point cargo at this process: the registry
