@@ -61,18 +61,19 @@ pub struct Request {
 pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> Result<()> {
     let metadata = cargo_metadata(&req.manifest_path, config).await?;
     let package = metadata.package_at(&req.manifest_path)?;
+    package.publishes_to(&req.registry)?;
 
-    match &package.publish {
-        Some(allowed) if allowed.contains(&req.registry) => {}
-        Some(allowed) if allowed.is_empty() => {
-            bail!("{} has publish = false", package.name)
-        }
-        _ => bail!(
-            "{} does not restrict where it publishes. Add `publish = [\"{}\"]` to its \
-             [package], so that no `cargo publish` can send it to crates.io",
+    // A version already in the index is done: published versions are immutable,
+    // and a CI job that publishes on every push to master must not fail on a
+    // push that did not bump it. Checked before packaging, since the tarball
+    // records the commit and so never matches the published one anyway.
+    if !req.dry_run && published(target, &package.name, &package.version).await? {
+        tracing::info!(
+            "{} {} is already published; bump the version to publish a change",
             package.name,
-            req.registry
-        ),
+            package.version
+        );
+        return Ok(());
     }
 
     let status = tokio::process::Command::new(cargo())
@@ -164,6 +165,19 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
         tracing::warn!(attempt, "the index entry changed underneath; retrying");
     }
     bail!("gave up after {CAS_ATTEMPTS} contended attempts to update the index")
+}
+
+/// Whether `version` of `name` is already in the index.
+async fn published(target: &Target<'_>, name: &str, version: &str) -> Result<bool> {
+    let (body, _) = get(target, &index_path(name)).await?;
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        let existing: Value = serde_json::from_str(line)
+            .with_context(|| format!("parsing the index entry for {name}"))?;
+        if existing["vers"] == version {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn cargo() -> String {
@@ -315,6 +329,21 @@ struct MetadataDependency {
 }
 
 impl Package {
+    /// Refuse unless the manifest restricts publishing to `registry`, so that
+    /// no plain `cargo publish` can send the crate to crates.io.
+    fn publishes_to(&self, registry: &str) -> Result<()> {
+        match &self.publish {
+            Some(allowed) if allowed.iter().any(|r| r == registry) => Ok(()),
+            Some(allowed) if allowed.is_empty() => bail!("{} has publish = false", self.name),
+            _ => bail!(
+                "{} does not restrict where it publishes. Add `publish = [\"{}\"]` to its \
+                 [package], so that no `cargo publish` can send it to crates.io",
+                self.name,
+                registry
+            ),
+        }
+    }
+
     fn index_entry(&self, cksum: &str, own_index: &str) -> Result<Value> {
         // `dep:` and `pkg?/feat` go in features2, so a cargo too old to parse
         // them skips the field instead of failing on the whole entry.
