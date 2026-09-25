@@ -244,9 +244,10 @@ async fn login(broker: &str) -> Result<()> {
 
 /// Exchange a broker token for a scoped object-store key.
 ///
-/// The registry's management surface is an endpoint-libs WebSocket: `Init`
-/// travels in `Sec-WebSocket-Protocol` at handshake time as
-/// `["0init", "1<token>"]`, and nothing else can be called until it resolves.
+/// The registry's management surface is an endpoint-libs WebSocket. A machine
+/// signs in with `TokenConnect`, which travels in `Sec-WebSocket-Protocol` at
+/// handshake time as `["0tokenconnect", "1<token>"]` (`Init` is for people, with
+/// a honey.id access token), and nothing else can be called until it resolves.
 /// That is a small enough wire contract to speak directly rather than take a
 /// dependency on the server's crate.
 async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
@@ -260,7 +261,7 @@ async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
         .with_context(|| format!("{broker} is not a valid WebSocket URL"))?;
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
-        HeaderValue::from_str(&format!("0init, 1{token}"))
+        HeaderValue::from_str(&format!("0tokenconnect, 1{token}"))
             .context("the token is not valid in a header")?,
     );
 
