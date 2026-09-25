@@ -19,6 +19,8 @@
 //! the listener, so no `.cargo/config.toml` index entry is needed and nothing
 //! is left behind when it exits.
 
+mod publish;
+
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
@@ -89,6 +91,12 @@ struct Args {
 
     #[arg(long, env = "CARGO_VIP_KEY_SECRET", hide_env_values = true)]
     key_secret: Option<String>,
+
+    /// A registry token, in place of the one `cargo vip login` stored: how CI
+    /// passes one, from a secret. A `ReadOnly` token builds; a `Publish` token
+    /// also runs `cargo vip publish`.
+    #[arg(long, env = "CARGO_VIP_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 
     /// Serve the index and stay in the foreground, printing the config stanza,
     /// instead of running cargo.
@@ -183,14 +191,14 @@ fn source(args: &Args, file: FileConfig) -> Result<Source> {
         (Some(_), None) | (None, Some(_)) => {
             bail!("--key-id and --key-secret must be given together")
         }
-        (None, None) => match file.token {
+        (None, None) => match args.token.clone().or(file.token) {
             Some(token) => Ok(Source::Broker {
                 url: file.broker.unwrap_or_else(|| args.broker.clone()),
                 token,
             }),
             None => bail!(
-                "not logged in: run `cargo vip login`, or pass --key-id/--key-secret \
-                 with --bucket to use a key directly"
+                "not logged in: run `cargo vip login` or set CARGO_VIP_TOKEN, or pass \
+                 --key-id/--key-secret with --bucket to use a key directly"
             ),
         },
     }
@@ -411,11 +419,23 @@ async fn main() -> Result<()> {
     });
 
     let serving = tokio::spawn(serve(listener, Arc::clone(&registry)));
-    let index_url = format!("sparse+{origin}/");
+    let loopback = format!("sparse+{origin}/");
+    // What crates and lockfiles name the registry by. Never fetched: cargo
+    // replaces it with the loopback source, and records the stable URL, so a
+    // lockfile and a packaged crate do not change with this run's port.
+    let stable = format!("sparse+https://crates.vip/{}/", registry.bucket.name());
+    let config = cargo_config(&args.registry, &stable, &loopback);
 
     if args.serve {
         println!("[registries.{}]", args.registry);
-        println!("index = \"{index_url}\"");
+        println!("index = \"{stable}\"");
+        println!();
+        println!("[source.{}-remote]", args.registry);
+        println!("registry = \"{stable}\"");
+        println!("replace-with = \"{}-loopback\"", args.registry);
+        println!();
+        println!("[source.{}-loopback]", args.registry);
+        println!("registry = \"{loopback}\"");
         tokio::signal::ctrl_c().await?;
         return Ok(());
     }
@@ -424,23 +444,69 @@ async fn main() -> Result<()> {
         bail!("nothing to run: try `cargo vip build`, or --serve to stay in the foreground");
     }
 
-    // Cargo takes the index from the environment, so wrapping a build needs no
-    // edit to `.cargo/config.toml`.
-    let env_key = format!(
-        "CARGO_REGISTRIES_{}_INDEX",
-        args.registry.to_uppercase().replace('-', "_")
-    );
+    if args.cargo_args.first().is_some_and(|a| a == "publish") {
+        let request = publish_request(&args.cargo_args[1..], &args.registry, &stable)?;
+        let target = publish::Target {
+            client: &registry.client,
+            bucket: &registry.bucket,
+            credentials: &registry.credentials,
+        };
+        let outcome = publish::publish(&target, &request, &config).await;
+        serving.abort();
+        return outcome;
+    }
 
+    // `--config` rather than `.cargo/config.toml`, so wrapping a build edits no
+    // file and leaves nothing behind.
     let status =
         tokio::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(&config)
             .args(&args.cargo_args)
-            .env(&env_key, &index_url)
             .status()
             .await
             .context("running cargo")?;
 
     serving.abort();
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The `--config` arguments that point cargo at this process: the registry
+/// under its stable URL, replaced by the loopback source.
+fn cargo_config(registry: &str, stable: &str, loopback: &str) -> Vec<String> {
+    [
+        format!("registries.{registry}.index=\"{stable}\""),
+        format!("source.{registry}-remote.registry=\"{stable}\""),
+        format!("source.{registry}-remote.replace-with=\"{registry}-loopback\""),
+        format!("source.{registry}-loopback.registry=\"{loopback}\""),
+    ]
+    .into_iter()
+    .flat_map(|setting| ["--config".to_owned(), setting])
+    .collect()
+}
+
+/// `cargo vip publish [--manifest-path PATH] [--dry-run]`.
+fn publish_request(rest: &[String], registry: &str, index_url: &str) -> Result<publish::Request> {
+    let mut manifest_path = PathBuf::from("Cargo.toml");
+    let mut dry_run = false;
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--manifest-path" => {
+                manifest_path = rest.next().context("--manifest-path needs a path")?.into();
+            }
+            other => match other.strip_prefix("--manifest-path=") {
+                Some(path) => manifest_path = path.into(),
+                None => bail!("cargo vip publish takes --manifest-path and --dry-run, not {other}"),
+            },
+        }
+    }
+    Ok(publish::Request {
+        manifest_path,
+        dry_run,
+        registry: registry.to_owned(),
+        index_url: index_url.to_owned(),
+    })
 }
 
 async fn serve(listener: TcpListener, registry: Arc<Registry>) {

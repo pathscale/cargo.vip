@@ -112,13 +112,43 @@ would impose one machine's port on everybody.
 
 ## Publishing
 
-Out of scope. This is a read path. Publishing is two S3 writes — the tarball
-under `If-None-Match: *`, and the index entry read-modify-written under
-`If-Match` — which a CI job can do with the AWS CLI and no bespoke tool.
+```
+cargo vip publish [--manifest-path PATH] [--dry-run]
+```
 
-One trap worth repeating: an index entry with no `registry` field means "this
-same registry", so **every crates.io dependency must name crates.io
-explicitly**. Omit it and the crate publishes fine and resolves nowhere.
+with a `Publish` token (from `cargo vip login` or `CARGO_VIP_TOKEN`). The
+registry hands that token a read-write key on its app's bucket, and the crate
+goes in as two writes: the tarball under `If-None-Match: *`, so a published
+version is immutable, then the index entry read-modify-written under
+`If-Match`, retried if another publisher got there first. Publishing the same
+commit again is a no-op; changing a published version is refused.
+
+**A crate is published only if it says `publish = ["vip"]`.** The default
+`publish` lets a stray `cargo publish` send private source to crates.io, so
+`cargo vip publish` refuses it until the manifest closes that door.
+
+A dependency on another crate in this registry is written as
+`{ version = "…", registry = "vip" }`. Its index entry omits `registry`, which
+means "this registry"; a crates.io dependency names crates.io explicitly.
+
+## CI
+
+One secret, the registry token, and no object-store key:
+
+```yaml
+- run: cargo install cargo-vip --locked
+- run: cargo vip build --release
+  env:
+    CARGO_VIP_TOKEN: ${{ secrets.CRATES_VIP_TOKEN }}
+```
+
+A `ReadOnly` token builds; a `Publish` token also runs `cargo vip publish`.
+
+## Lockfiles
+
+A crate names the registry by a stable URL, `sparse+https://crates.vip/<bucket>/`,
+which cargo replaces with this run's loopback source. Lockfiles and packaged
+crates record the stable URL, so neither changes with the port.
 
 ## Security notes
 
