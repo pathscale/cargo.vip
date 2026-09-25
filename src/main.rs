@@ -572,7 +572,7 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
             .sign(DOWNLOAD_TTL)
             .to_string();
 
-        tracing::info!("{name} {version} -> presigned");
+        tracing::debug!("{name} {version} -> presigned");
         return Ok(Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header("location", url)
@@ -610,7 +610,7 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
         .await
         .context("reading the index entry")?;
 
-    tracing::info!("{key}");
+    tracing::debug!("{key}");
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")

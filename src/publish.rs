@@ -77,7 +77,10 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
 
     let status = tokio::process::Command::new(cargo())
         .args(config)
-        .args(["package", "--manifest-path"])
+        // Quiet: a private crate carries no description, docs or homepage, so
+        // cargo's metadata warning and its build chatter are noise here. Errors
+        // still print.
+        .args(["package", "--quiet", "--manifest-path"])
         .arg(&req.manifest_path)
         .status()
         .await
@@ -94,8 +97,8 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
     let cksum = hex::encode(Sha256::digest(&tarball));
     let entry = package.index_entry(&cksum, &req.index_url)?;
 
-    tracing::info!("registry bucket {} (the token's app)", target.bucket.name());
     if req.dry_run {
+        tracing::info!("registry bucket {} (the token's app)", target.bucket.name());
         println!("{}", serde_json::to_string_pretty(&entry)?);
         tracing::info!("dry run: nothing written");
         return Ok(());
@@ -119,9 +122,9 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
     )
     .await?;
     if status == PRECONDITION_FAILED {
-        tracing::info!("tarball already present");
+        tracing::debug!("tarball already present");
     } else {
-        tracing::info!("uploaded {key}");
+        tracing::debug!("uploaded {key}");
     }
 
     let path = index_path(&package.name);
