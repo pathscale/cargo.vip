@@ -1,6 +1,6 @@
 [package]
 name = "cargo-vip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,6 +22,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
+sha2 = "0.10"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
