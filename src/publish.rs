@@ -55,6 +55,82 @@ pub struct Request {
     pub index_url: String,
 }
 
+/// Publish every workspace member that says `publish = [registry]`, each after
+/// the members it depends on. A version already there is skipped, so this is
+/// safe to run on every merge.
+///
+/// # Errors
+/// If the members depend on each other in a cycle, or a publish fails.
+pub async fn publish_workspace(
+    target: &Target<'_>,
+    req: &Request,
+    config: &[String],
+) -> Result<()> {
+    let metadata = cargo_metadata(&req.manifest_path, config).await?;
+    let members: Vec<(&str, Vec<&str>, &Path)> = metadata
+        .packages
+        .iter()
+        .filter(|p| {
+            p.publish
+                .as_ref()
+                .is_some_and(|r| r.contains(&req.registry))
+        })
+        .map(|p| {
+            let deps = p.dependencies.iter().map(|d| d.name.as_str()).collect();
+            (p.name.as_str(), deps, p.manifest_path.as_path())
+        })
+        .collect();
+    let order = dependency_order(
+        &members
+            .iter()
+            .map(|(name, deps, _)| (*name, deps.clone()))
+            .collect::<Vec<_>>(),
+    )?;
+    tracing::info!("publishing in order: {}", order.join(", "));
+    for name in order {
+        let (_, _, manifest) = members
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .expect("ordered from the members");
+        let one = Request {
+            manifest_path: manifest.to_path_buf(),
+            dry_run: req.dry_run,
+            registry: req.registry.clone(),
+            index_url: req.index_url.clone(),
+        };
+        publish(target, &one, config).await?;
+    }
+    Ok(())
+}
+
+/// `members` as (name, its dependencies), ordered so each comes after every
+/// member it depends on. Dependencies outside `members` are ignored.
+fn dependency_order<'a>(members: &[(&'a str, Vec<&'a str>)]) -> Result<Vec<&'a str>> {
+    let names: Vec<&str> = members.iter().map(|(n, _)| *n).collect();
+    let mut done: Vec<&str> = Vec::new();
+    while done.len() < members.len() {
+        let ready: Vec<&str> = members
+            .iter()
+            .filter(|(n, deps)| {
+                !done.contains(n)
+                    && deps
+                        .iter()
+                        .all(|d| !names.contains(d) || done.contains(d) || d == n)
+            })
+            .map(|(n, _)| *n)
+            .collect();
+        if ready.is_empty() {
+            let stuck: Vec<&str> = names.into_iter().filter(|n| !done.contains(n)).collect();
+            bail!(
+                "these crates depend on each other in a cycle: {}",
+                stuck.join(", ")
+            );
+        }
+        done.extend(ready);
+    }
+    Ok(done)
+}
+
 /// # Errors
 /// If the crate may not be published here, cannot be packaged, or a write
 /// fails.
@@ -394,7 +470,7 @@ fn without_nulls(mut value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_path, same_index};
+    use super::{dependency_order, index_path, same_index};
 
     #[test]
     fn index_paths_follow_the_sparse_layout() {
@@ -402,6 +478,18 @@ mod tests {
         assert_eq!(index_path("ab"), "2/ab");
         assert_eq!(index_path("abc"), "3/a/abc");
         assert_eq!(index_path("Pays-Hash"), "pa/ys/pays-hash");
+    }
+
+    #[test]
+    fn members_publish_after_what_they_depend_on() {
+        let order = dependency_order(&[
+            ("log", vec!["flow", "hash", "serde"]),
+            ("flow", vec!["hash"]),
+            ("hash", vec![]),
+        ])
+        .unwrap();
+        assert_eq!(order, ["hash", "flow", "log"]);
+        assert!(dependency_order(&[("a", vec!["b"]), ("b", vec!["a"])]).is_err());
     }
 
     #[test]

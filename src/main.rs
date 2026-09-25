@@ -445,13 +445,17 @@ async fn main() -> Result<()> {
     }
 
     if args.cargo_args.first().is_some_and(|a| a == "publish") {
-        let request = publish_request(&args.cargo_args[1..], &args.registry, &stable)?;
+        let (request, workspace) = publish_request(&args.cargo_args[1..], &args.registry, &stable)?;
         let target = publish::Target {
             client: &registry.client,
             bucket: &registry.bucket,
             credentials: &registry.credentials,
         };
-        let outcome = publish::publish(&target, &request, &config).await;
+        let outcome = if workspace {
+            publish::publish_workspace(&target, &request, &config).await
+        } else {
+            publish::publish(&target, &request, &config).await
+        };
         serving.abort();
         return outcome;
     }
@@ -485,28 +489,39 @@ fn cargo_config(registry: &str, stable: &str, loopback: &str) -> Vec<String> {
 }
 
 /// `cargo vip publish [--manifest-path PATH] [--dry-run]`.
-fn publish_request(rest: &[String], registry: &str, index_url: &str) -> Result<publish::Request> {
+fn publish_request(
+    rest: &[String],
+    registry: &str,
+    index_url: &str,
+) -> Result<(publish::Request, bool)> {
+    let mut workspace = false;
     let mut manifest_path = PathBuf::from("Cargo.toml");
     let mut dry_run = false;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--workspace" => workspace = true,
             "--manifest-path" => {
                 manifest_path = rest.next().context("--manifest-path needs a path")?.into();
             }
             other => match other.strip_prefix("--manifest-path=") {
                 Some(path) => manifest_path = path.into(),
-                None => bail!("cargo vip publish takes --manifest-path and --dry-run, not {other}"),
+                None => bail!(
+                    "cargo vip publish takes --workspace, --manifest-path and --dry-run, not {other}"
+                ),
             },
         }
     }
-    Ok(publish::Request {
-        manifest_path,
-        dry_run,
-        registry: registry.to_owned(),
-        index_url: index_url.to_owned(),
-    })
+    Ok((
+        publish::Request {
+            manifest_path,
+            dry_run,
+            registry: registry.to_owned(),
+            index_url: index_url.to_owned(),
+        },
+        workspace,
+    ))
 }
 
 async fn serve(listener: TcpListener, registry: Arc<Registry>) {
