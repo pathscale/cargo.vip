@@ -1,12 +1,21 @@
 name: publish
 
-# Pushing a `v<version>` tag publishes that version of cargo-vip to crates.io.
-# The tag must match `version` in Cargo.toml: a published version can't be
-# withdrawn, so a mismatched tag fails here instead of shipping.
+# Publishes cargo-vip to crates.io when the version in Cargo.toml changes, and
+# only then, as the rest of the fleet's crates do. Bumping `version` in a
+# merged PR is the release; the `v<version>` tag is created here afterwards,
+# pointing at the commit that was published.
+#
+# This used to wait for a hand-pushed tag, and 0.1.4 merged without one: the
+# version sat in Cargo.toml and never reached crates.io.
+#
+# A published version can't be withdrawn, so the check runs against crates.io
+# itself rather than against the previous commit: a version already there is
+# skipped, and a rerun after a failed publish tries again.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,19 +24,41 @@ env:
 jobs:
   publish:
     runs-on: ubicloud-standard-2
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Tag matches Cargo.toml
+      - name: Is this version published?
+        id: decide
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets
-      - run: cargo test
-      - run: cargo publish
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A "pathscale/cargo.vip publish" \
+            "https://crates.io/api/v1/crates/cargo-vip/$version")
+          if [ "$status" = 200 ]; then
+            echo "cargo-vip $version is already on crates.io"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.decide.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - if: steps.decide.outputs.publish == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.decide.outputs.publish == 'true'
+        run: cargo fmt --check
+      - if: steps.decide.outputs.publish == 'true'
+        run: cargo clippy --all-targets
+      - if: steps.decide.outputs.publish == 'true'
+        run: cargo test
+      - if: steps.decide.outputs.publish == 'true'
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Tag the published commit
+        if: steps.decide.outputs.publish == 'true'
+        run: |
+          git tag "v${{ steps.decide.outputs.version }}"
+          git push origin "v${{ steps.decide.outputs.version }}"
