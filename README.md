@@ -42,9 +42,10 @@ cargo vip login
 ```
 
 stores a token for the registry management API in
-`~/.config/cargo-vip/credentials.toml` (mode `0600`). Each run exchanges that
-token for a scoped access key, kept **in memory only** and never written to
-disk. Revoking the token at the registry ends access at the next build.
+`~/.config/cargo-vip/credentials.toml` (mode `0600`), keyed by the bucket that
+issued it. Each run exchanges the selected token for a scoped access key, kept
+**in memory only** and never written to disk. Revoking the token at the
+registry ends access at the next build.
 
 Then depend on a private crate as usual:
 
@@ -61,9 +62,44 @@ cargo vip test
 cargo vip update
 ```
 
-The wrapper sets `CARGO_REGISTRIES_VIP_INDEX` for the child process only, so
-there is no `.cargo/config.toml` entry to add and nothing left behind when it
-exits.
+With one saved token, the wrapper can select it without a registry index in
+Cargo config. When you have tokens for multiple products, add an index entry to
+each repository so `cargo vip` knows which bucket that project uses.
+
+## Several products on one machine
+
+Each crates.vip app issues tokens for its own bucket. Run `cargo vip login`
+once for each product and paste that product's token. Login adds or replaces
+only the entry for the bucket returned by the registry; tokens for other
+products stay in `~/.config/cargo-vip/credentials.toml`.
+
+In each repository, configure the registry name used by its dependencies. For
+the default name, `vip`:
+
+```toml
+# .cargo/config.toml
+[registries.vip]
+index = "sparse+https://crates.vip/<bucket>/"
+```
+
+Cargo config is found by walking up from the current directory, so this also
+works when you run `cargo vip` from a nested folder. Set
+`CARGO_REGISTRIES_VIP_INDEX` to override that index for a run. If a project
+uses another registry name, pass it to the wrapper and configure that name:
+
+```toml
+[registries.backend]
+index = "sparse+https://crates.vip/<backend-bucket>/"
+```
+
+```sh
+cargo vip --registry backend build
+```
+
+The saved credentials file has one `[[registry]]` entry per bucket. A previous
+single-token file still works and is migrated the next time a login can resolve
+its bucket. If the selected bucket has no saved token, `cargo vip` reports the
+bucket and asks you to run `cargo vip login` with a token for it.
 
 ### Using a key directly
 

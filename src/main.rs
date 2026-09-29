@@ -16,8 +16,8 @@
 //! ```
 //!
 //! wraps the cargo invocation with `CARGO_REGISTRIES_<NAME>_INDEX` pointed at
-//! the listener, so no `.cargo/config.toml` index entry is needed and nothing
-//! is left behind when it exits.
+//! the listener, so no temporary `.cargo/config.toml` entry is needed and
+//! nothing is left behind when it exits.
 
 mod publish;
 
@@ -31,9 +31,9 @@ use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use rusty_s3::actions::GetObject;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -92,9 +92,9 @@ struct Args {
     #[arg(long, env = "CARGO_VIP_KEY_SECRET", hide_env_values = true)]
     key_secret: Option<String>,
 
-    /// A registry token, in place of the one `cargo vip login` stored: how CI
-    /// passes one, from a secret. A `ReadOnly` token builds; a `Publish` token
-    /// also runs `cargo vip publish`.
+    /// A registry token in place of the saved token for the selected bucket;
+    /// CI passes one from a secret. A `ReadOnly` token builds; a `Publish`
+    /// token also runs `cargo vip publish`.
     #[arg(long, env = "CARGO_VIP_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
@@ -111,19 +111,36 @@ struct Args {
 
 /// `~/.config/cargo-vip/credentials.toml`.
 ///
-/// In the default flow this holds only `token` — a credential for the registry
-/// management API, which is revocable and is not an object-store key. The
-/// `key_id`/`key_secret` fields exist for buckets with no broker in front of
-/// them; setting them skips the broker entirely.
-#[derive(Deserialize, Default)]
+/// In the default flow this holds broker tokens, one for each registry bucket.
+/// The old top-level `token` field remains readable as a legacy single-token
+/// file. `key_id`/`key_secret` are for buckets with no broker in front of them.
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
 struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     broker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     key_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    registry: Vec<RegistryToken>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RegistryToken {
+    bucket: String,
+    token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broker: Option<String>,
 }
 
 /// What the registry needs to be read, however it was obtained.
@@ -144,7 +161,12 @@ enum Source {
     /// Explicit key. Skips the broker.
     Static(Resolved),
     /// Exchange a token for a scoped key at each run.
-    Broker { url: String, token: String },
+    Broker {
+        url: String,
+        token: String,
+        expected_bucket: Option<String>,
+        legacy: bool,
+    },
 }
 
 fn credentials_path() -> Option<PathBuf> {
@@ -167,13 +189,13 @@ fn load_file_config() -> Result<FileConfig> {
 
 /// Decide where credentials come from.
 ///
-/// An explicit key always wins, so CI and any bucket without a broker keep
-/// working and never touch the network for credentials. Otherwise the broker
-/// token is used, which is the default for a person.
-fn source(args: &Args, file: FileConfig) -> Result<Source> {
-    let key_id = args.key_id.clone().or(file.key_id);
-    let key_secret = args.key_secret.clone().or(file.key_secret);
-    let bucket = args.bucket.clone().or(file.bucket);
+/// An explicit key keeps working without contacting the broker. A supplied
+/// token wins over saved tokens; otherwise select the saved token for the
+/// bucket named by this registry's Cargo index.
+fn source(args: &Args, file: &FileConfig, index: Option<&str>) -> Result<Source> {
+    let key_id = args.key_id.clone().or(file.key_id.clone());
+    let key_secret = args.key_secret.clone().or(file.key_secret.clone());
+    let bucket = args.bucket.clone().or(file.bucket.clone());
 
     match (key_id, key_secret) {
         (Some(key_id), Some(key_secret)) => {
@@ -184,23 +206,234 @@ fn source(args: &Args, file: FileConfig) -> Result<Source> {
                 key_id,
                 key_secret,
                 bucket,
-                endpoint: file.endpoint.unwrap_or_else(|| args.endpoint.clone()),
-                region: file.region.unwrap_or_else(|| args.region.clone()),
+                endpoint: file
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| args.endpoint.clone()),
+                region: file.region.clone().unwrap_or_else(|| args.region.clone()),
             }))
         }
         (Some(_), None) | (None, Some(_)) => {
             bail!("--key-id and --key-secret must be given together")
         }
-        (None, None) => match args.token.clone().or(file.token) {
-            Some(token) => Ok(Source::Broker {
-                url: file.broker.unwrap_or_else(|| args.broker.clone()),
+        (None, None) => {
+            let target_bucket = index
+                .map(|index| bucket_from_index(index, &args.registry))
+                .transpose()?
+                .or_else(|| args.bucket.clone());
+
+            if let Some(token) = args.token.clone() {
+                return Ok(Source::Broker {
+                    url: args.broker.clone(),
+                    token,
+                    expected_bucket: target_bucket,
+                    legacy: false,
+                });
+            }
+
+            stored_token_source(file, &args.registry, target_bucket, &args.broker)
+        }
+    }
+}
+
+fn stored_token_source(
+    file: &FileConfig,
+    registry: &str,
+    target_bucket: Option<String>,
+    default_broker: &str,
+) -> Result<Source> {
+    let broker_for = |broker: &Option<String>| {
+        broker
+            .clone()
+            .or_else(|| file.broker.clone())
+            .unwrap_or_else(|| default_broker.to_owned())
+    };
+
+    if let Some(bucket) = target_bucket {
+        if let Some(entry) = file.registry.iter().find(|entry| entry.bucket == bucket) {
+            return Ok(Source::Broker {
+                url: broker_for(&entry.broker),
+                token: entry.token.clone(),
+                expected_bucket: Some(bucket),
+                legacy: false,
+            });
+        }
+
+        // Old credentials.toml files have no bucket field. Try the old token
+        // once and accept it only when the broker confirms it belongs here.
+        if let Some(token) = file.token.clone() {
+            return Ok(Source::Broker {
+                url: broker_for(&file.broker),
                 token,
-            }),
-            None => bail!(
-                "not logged in: run `cargo vip login` or set CARGO_VIP_TOKEN, or pass \
-                 --key-id/--key-secret with --bucket to use a key directly"
-            ),
-        },
+                expected_bucket: Some(bucket),
+                legacy: true,
+            });
+        }
+        bail!(missing_token_message(&bucket));
+    }
+
+    match (file.registry.as_slice(), file.token.as_ref()) {
+        ([], Some(token)) => Ok(Source::Broker {
+            url: broker_for(&file.broker),
+            token: token.clone(),
+            expected_bucket: None,
+            legacy: true,
+        }),
+        ([entry], None) => Ok(Source::Broker {
+            url: broker_for(&entry.broker),
+            token: entry.token.clone(),
+            expected_bucket: Some(entry.bucket.clone()),
+            legacy: false,
+        }),
+        ([], None) => bail!(
+            "not logged in: run `cargo vip login` or set CARGO_VIP_TOKEN, or pass \
+             --key-id/--key-secret with --bucket to use a key directly"
+        ),
+        _ => bail!(
+            "more than one registry token is stored; set [registries.{registry}].index \
+             in .cargo/config.toml or {} to select a bucket",
+            index_env(registry)
+        ),
+    }
+}
+
+fn missing_token_message(bucket: &str) -> String {
+    format!(
+        "no token stored for registry bucket `{bucket}`; run `cargo vip login` and enter a token for this bucket"
+    )
+}
+
+/// Resolve Cargo's index for this registry. Cargo-specific environment
+/// settings override the nearest project config; `CARGO_HOME` is the final file
+/// fallback just as it is for Cargo.
+fn cargo_registry_index(registry: &str) -> Result<Option<String>> {
+    let cwd = std::env::current_dir().context("getting the current directory")?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let environment_index =
+        std::env::var_os(index_env(registry)).map(|index| index.to_string_lossy().into_owned());
+    find_registry_index(
+        registry,
+        &cwd,
+        cargo_home.as_deref(),
+        environment_index.as_deref(),
+    )
+}
+
+fn find_registry_index(
+    registry: &str,
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    environment_index: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(index) = environment_index {
+        return Ok(Some(index.to_owned()));
+    }
+
+    for directory in cwd.ancestors() {
+        if let Some(index) = registry_index_in_dir(directory, registry)? {
+            return Ok(Some(index));
+        }
+    }
+    if let Some(cargo_home) = cargo_home {
+        if let Some(index) = registry_index_in_cargo_home(cargo_home, registry)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn registry_index_in_dir(directory: &Path, registry: &str) -> Result<Option<String>> {
+    let cargo_dir = directory.join(".cargo");
+    for name in ["config.toml", "config"] {
+        if let Some(index) = registry_index_in_file(&cargo_dir.join(name), registry)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn registry_index_in_cargo_home(directory: &Path, registry: &str) -> Result<Option<String>> {
+    for name in ["config.toml", "config"] {
+        if let Some(index) = registry_index_in_file(&directory.join(name), registry)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn registry_index_in_file(path: &Path, registry: &str) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let config: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing Cargo config {}", path.display()))?;
+    let Some(registries) = config.get("registries") else {
+        return Ok(None);
+    };
+    let Some(registry_config) = registries.get(registry) else {
+        return Ok(None);
+    };
+    let Some(index) = registry_config.get("index") else {
+        return Ok(None);
+    };
+    index
+        .as_str()
+        .map(|index| Some(index.to_owned()))
+        .with_context(|| {
+            format!(
+                "registries.{registry}.index in {} must be a string",
+                path.display()
+            )
+        })
+}
+
+fn bucket_from_index(index: &str, registry: &str) -> Result<String> {
+    let url = index.strip_prefix("sparse+").unwrap_or(index);
+    let (scheme, rest) = url
+        .split_once("://")
+        .with_context(|| format!("registry {registry:?} index {index:?} is not a URL"))?;
+    if scheme != "https" && scheme != "http" {
+        bail!("registry {registry:?} index {index:?} must use HTTP or HTTPS");
+    }
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if !host.eq_ignore_ascii_case("crates.vip") {
+        bail!(
+            "registry {registry:?} index {index:?} is not a crates.vip index URL of the form \
+             sparse+https://crates.vip/<bucket>/"
+        );
+    }
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let bucket = path
+        .split('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    if bucket.is_empty() {
+        bail!("registry {registry:?} index {index:?} does not name a bucket");
+    }
+    Ok(bucket.to_owned())
+}
+
+fn save_registry_token(file: &mut FileConfig, bucket: &str, token: &str, broker: &str) {
+    let entry = RegistryToken {
+        bucket: bucket.to_owned(),
+        token: token.to_owned(),
+        broker: Some(broker.to_owned()),
+    };
+    if let Some(existing) = file.registry.iter_mut().find(|item| item.bucket == bucket) {
+        *existing = entry;
+    } else {
+        file.registry.push(entry);
     }
 }
 
@@ -208,7 +441,7 @@ fn source(args: &Args, file: FileConfig) -> Result<Source> {
 ///
 /// The token is what gets persisted; the object-store key never is. Revoking
 /// the token at the registry therefore ends access at the next build.
-async fn login(broker: &str) -> Result<()> {
+async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
     let Some(path) = credentials_path() else {
         bail!("cannot determine a config directory");
     };
@@ -226,17 +459,37 @@ async fn login(broker: &str) -> Result<()> {
     // Verify before storing, so a typo fails here and not inside a build.
     let resolved = issue_credentials(broker, token).await?;
 
+    // A pre-multi-registry file has one top-level token but no bucket. Resolve
+    // it once so the next write can migrate it without discarding access to a
+    // different product. If the old token is no longer valid, keep it intact
+    // as a legacy entry while still saving the newly verified token.
+    if let Some(legacy_token) = file.token.clone() {
+        if legacy_token == token {
+            file.token = None;
+            file.broker = None;
+        } else {
+            let legacy_broker = file.broker.clone().unwrap_or_else(|| broker.to_owned());
+            match issue_credentials(&legacy_broker, &legacy_token).await {
+                Ok(old) => {
+                    if !file.registry.iter().any(|entry| entry.bucket == old.bucket) {
+                        save_registry_token(&mut file, &old.bucket, &legacy_token, &legacy_broker);
+                    }
+                    file.token = None;
+                    file.broker = None;
+                }
+                Err(_) => eprintln!(
+                    "warning: could not resolve the previous single-token credentials; keeping them in legacy form"
+                ),
+            }
+        }
+    }
+    save_registry_token(&mut file, &resolved.bucket, token, broker);
+
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    // The broker is stored with the token: a person should not have to repeat
-    // --broker on every build, and a token is only meaningful against the
-    // registry that issued it.
-    std::fs::write(
-        &path,
-        format!("token = \"{token}\"\nbroker = \"{broker}\"\n"),
-    )
-    .with_context(|| format!("writing {}", path.display()))?;
+    let text = toml::to_string_pretty(&file).context("serializing credentials")?;
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
 
     // The file holds a credential; other users on the machine should not read it.
     #[cfg(unix)]
@@ -359,6 +612,58 @@ impl Registry {
     }
 }
 
+/// The key this run uses: explicit, or issued by the broker for the bucket the
+/// registry is configured for.
+async fn resolve(args: &Args, file: &FileConfig) -> Result<Resolved> {
+    let index = if args.key_id.is_some()
+        || args.key_secret.is_some()
+        || file.key_id.is_some()
+        || file.key_secret.is_some()
+    {
+        None
+    } else {
+        cargo_registry_index(&args.registry)?
+    };
+    Ok(match source(args, file, index.as_deref())? {
+        Source::Static(resolved) => resolved,
+        Source::Broker {
+            url,
+            token,
+            expected_bucket,
+            legacy,
+        } => {
+            let resolved = match issue_credentials(&url, &token).await {
+                Ok(resolved) => resolved,
+                Err(error) if legacy && expected_bucket.is_some() => {
+                    return Err(error.context(missing_token_message(
+                        expected_bucket.as_deref().unwrap_or_default(),
+                    )));
+                }
+                Err(error) if legacy => {
+                    return Err(error.context(
+                        "the saved single-token credentials could not be used; run `cargo vip login` to replace them",
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(expected_bucket) = expected_bucket {
+                if resolved.bucket != expected_bucket {
+                    if legacy {
+                        bail!("{}", missing_token_message(&expected_bucket));
+                    }
+                    bail!(
+                        "the selected token resolves to bucket `{}`, but registry `{}` is configured for bucket `{}`",
+                        resolved.bucket,
+                        args.registry,
+                        expected_bucket
+                    );
+                }
+            }
+            resolved
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -377,13 +682,10 @@ async fn main() -> Result<()> {
     let file = load_file_config()?;
 
     if args.cargo_args.first().is_some_and(|a| a == "login") {
-        return login(&args.broker).await;
+        return login(&args.broker, file).await;
     }
 
-    let resolved = match source(&args, file)? {
-        Source::Static(resolved) => resolved,
-        Source::Broker { url, token } => issue_credentials(&url, &token).await?,
-    };
+    let resolved = resolve(&args, &file).await?;
     let (key_id, key_secret, bucket_name, endpoint, region) = (
         resolved.key_id,
         resolved.key_secret,
@@ -646,7 +948,35 @@ fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
+    use super::{
+        Args, FileConfig, Registry, Source, bucket_from_index, find_registry_index,
+        missing_token_message, save_registry_token, source,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn args() -> Args {
+        Args {
+            registry: "vip".to_owned(),
+            endpoint: "https://fly.storage.tigris.dev".to_owned(),
+            region: "auto".to_owned(),
+            bucket: None,
+            broker: "wss://api.crates.vip".to_owned(),
+            key_id: None,
+            key_secret: None,
+            token: None,
+            serve: false,
+            cargo_args: Vec::new(),
+        }
+    }
+
+    fn test_directory() -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cargo-vip-test-{}-{nonce}", std::process::id()))
+    }
 
     #[test]
     fn crate_key_is_content_addressed() {
@@ -654,5 +984,158 @@ mod tests {
             Registry::crate_key("worktable", "1.0.0-beta.11", "abc123"),
             "crates/worktable-1.0.0-beta.11_abc123.tar.gz",
         );
+    }
+
+    #[test]
+    fn reads_the_legacy_single_token_file() {
+        let file: FileConfig =
+            toml::from_str("broker = \"wss://old.example\"\ntoken = \"old-token\"\n").unwrap();
+        assert_eq!(file.token.as_deref(), Some("old-token"));
+        assert!(file.registry.is_empty());
+    }
+
+    #[test]
+    fn replacing_a_bucket_token_preserves_other_buckets() {
+        let mut file = FileConfig::default();
+        save_registry_token(&mut file, "alpha", "old-alpha", "wss://alpha.example");
+        save_registry_token(&mut file, "beta", "beta-token", "wss://beta.example");
+        save_registry_token(&mut file, "alpha", "new-alpha", "wss://alpha.example");
+
+        assert_eq!(file.registry.len(), 2);
+        assert_eq!(file.registry[0].bucket, "alpha");
+        assert_eq!(file.registry[0].token, "new-alpha");
+        assert_eq!(file.registry[1].bucket, "beta");
+        assert_eq!(file.registry[1].token, "beta-token");
+    }
+
+    #[test]
+    fn registry_tokens_round_trip_as_array_tables() {
+        let mut file = FileConfig::default();
+        save_registry_token(&mut file, "alpha", "alpha-token", "wss://alpha.example");
+        save_registry_token(&mut file, "beta", "beta-token", "wss://beta.example");
+
+        let encoded = toml::to_string_pretty(&file).unwrap();
+        assert!(encoded.contains("[[registry]]"));
+        let decoded: FileConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.registry.len(), 2);
+        assert_eq!(decoded.registry[1].bucket, "beta");
+        assert_eq!(decoded.registry[1].token, "beta-token");
+    }
+
+    #[test]
+    fn selects_the_saved_token_for_the_configured_registry_bucket() {
+        let mut file = FileConfig::default();
+        save_registry_token(&mut file, "alpha", "alpha-token", "wss://alpha.example");
+        save_registry_token(&mut file, "beta", "beta-token", "wss://beta.example");
+
+        let selected = source(&args(), &file, Some("sparse+https://crates.vip/beta/")).unwrap();
+        match selected {
+            Source::Broker {
+                token,
+                expected_bucket,
+                ..
+            } => {
+                assert_eq!(token, "beta-token");
+                assert_eq!(expected_bucket.as_deref(), Some("beta"));
+            }
+            Source::Static(_) => panic!("expected broker credentials"),
+        }
+    }
+
+    #[test]
+    fn explicit_token_overrides_saved_bucket_tokens() {
+        let mut file = FileConfig::default();
+        save_registry_token(&mut file, "alpha", "alpha-token", "wss://alpha.example");
+        let mut args = args();
+        args.token = Some("ci-token".to_owned());
+
+        let selected = source(&args, &file, Some("sparse+https://crates.vip/beta/")).unwrap();
+        match selected {
+            Source::Broker { url, token, .. } => {
+                assert_eq!(token, "ci-token");
+                assert_eq!(url, "wss://api.crates.vip");
+            }
+            Source::Static(_) => panic!("expected broker credentials"),
+        }
+    }
+
+    #[test]
+    fn missing_selected_bucket_reports_login_command() {
+        let file = FileConfig::default();
+        let result = source(&args(), &file, Some("sparse+https://crates.vip/beta/"));
+        match result {
+            Err(error) => assert_eq!(error.to_string(), missing_token_message("beta")),
+            Ok(_) => panic!("expected missing-token error"),
+        }
+    }
+
+    #[test]
+    fn missing_bucket_error_names_the_login_command() {
+        assert_eq!(
+            missing_token_message("beta"),
+            "no token stored for registry bucket `beta`; run `cargo vip login` and enter a token for this bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_comes_from_the_sparse_index_path() {
+        assert_eq!(
+            bucket_from_index("sparse+https://crates.vip/product-bucket/", "vip").unwrap(),
+            "product-bucket"
+        );
+        assert!(bucket_from_index("https://example.com/product-bucket/", "vip").is_err());
+    }
+
+    #[test]
+    fn registry_index_uses_nearest_config_and_environment_override() {
+        let root = test_directory();
+        let project = root.join("project");
+        let nested = project.join("src").join("nested");
+        let cargo_home = root.join("cargo-home");
+        fs::create_dir_all(project.join(".cargo")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&cargo_home).unwrap();
+        fs::create_dir_all(root.join(".cargo")).unwrap();
+        fs::write(
+            root.join(".cargo/config.toml"),
+            "[registries.vip]\nindex = \"sparse+https://crates.vip/parent/\"\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".cargo/config.toml"),
+            "[registries.vip]\nindex = \"sparse+https://crates.vip/project/\"\n",
+        )
+        .unwrap();
+        fs::write(
+            cargo_home.join("config.toml"),
+            "[registries.vip]\nindex = \"sparse+https://crates.vip/global/\"\n",
+        )
+        .unwrap();
+
+        let project_index = find_registry_index("vip", &nested, Some(&cargo_home), None).unwrap();
+        assert_eq!(
+            project_index.as_deref(),
+            Some("sparse+https://crates.vip/project/")
+        );
+        let environment_index = find_registry_index(
+            "vip",
+            &nested,
+            Some(&cargo_home),
+            Some("sparse+https://crates.vip/environment/"),
+        )
+        .unwrap();
+        assert_eq!(
+            environment_index.as_deref(),
+            Some("sparse+https://crates.vip/environment/")
+        );
+        fs::remove_dir_all(root.join(".cargo")).unwrap();
+        let unrelated = root.join("unrelated");
+        fs::create_dir_all(&unrelated).unwrap();
+        let global_index = find_registry_index("vip", &unrelated, Some(&cargo_home), None).unwrap();
+        assert_eq!(
+            global_index.as_deref(),
+            Some("sparse+https://crates.vip/global/")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
