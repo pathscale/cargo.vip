@@ -220,6 +220,7 @@ fn source(args: &Args, file: &FileConfig, index: Option<&str>) -> Result<Source>
             let target_bucket = index
                 .map(|index| bucket_from_index(index, &args.registry))
                 .transpose()?
+                .flatten()
                 .or_else(|| args.bucket.clone());
 
             if let Some(token) = args.token.clone() {
@@ -391,7 +392,7 @@ fn registry_index_in_file(path: &Path, registry: &str) -> Result<Option<String>>
         })
 }
 
-fn bucket_from_index(index: &str, registry: &str) -> Result<String> {
+fn bucket_from_index(index: &str, registry: &str) -> Result<Option<String>> {
     let url = index.strip_prefix("sparse+").unwrap_or(index);
     let (scheme, rest) = url
         .split_once("://")
@@ -421,8 +422,16 @@ fn bucket_from_index(index: &str, registry: &str) -> Result<String> {
     if bucket.is_empty() {
         bail!("registry {registry:?} index {index:?} does not name a bucket");
     }
-    Ok(bucket.to_owned())
+    // `crates.vip/index/` is the name-only placeholder repositories declared before
+    // tokens were kept per bucket. It names no bucket, so the token decides.
+    if bucket == PLACEHOLDER_BUCKET {
+        return Ok(None);
+    }
+    Ok(Some(bucket.to_owned()))
 }
+
+/// The path segment of the placeholder index `sparse+https://crates.vip/index/`.
+const PLACEHOLDER_BUCKET: &str = "index";
 
 fn save_registry_token(file: &mut FileConfig, bucket: &str, token: &str, broker: &str) {
     let entry = RegistryToken {
@@ -1081,9 +1090,17 @@ mod tests {
     fn bucket_comes_from_the_sparse_index_path() {
         assert_eq!(
             bucket_from_index("sparse+https://crates.vip/product-bucket/", "vip").unwrap(),
-            "product-bucket"
+            Some("product-bucket".to_owned())
         );
         assert!(bucket_from_index("https://example.com/product-bucket/", "vip").is_err());
+    }
+
+    #[test]
+    fn the_placeholder_index_names_no_bucket() {
+        assert_eq!(
+            bucket_from_index("sparse+https://crates.vip/index/", "vip").unwrap(),
+            None
+        );
     }
 
     #[test]
