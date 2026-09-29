@@ -1,0 +1,160 @@
+name: release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and replace assets for the current version
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-info:
+    runs-on: ubicloud-standard-2
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      build: ${{ steps.release.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")
+          if [ "$status" = 200 ]; then
+            echo "$tag already has a GitHub release"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [ "$status" = 404 ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::GitHub release lookup returned HTTP $status" >&2
+            exit 1
+          fi
+
+  build:
+    needs: release-info
+    if: needs.release-info.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            builder: cargo
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            builder: cargo
+          - target: aarch64-unknown-linux-musl
+            runner: ubicloud-standard-2
+            builder: cross
+          - target: x86_64-unknown-linux-musl
+            runner: ubicloud-standard-2
+            builder: cross
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.builder == 'cross'
+        name: Install cross
+        run: |
+          sudo systemctl start docker
+          cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Build cargo-vip
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          if [ "$BUILDER" = cross ]; then
+            cross build --release --target "$TARGET" --bin cargo-vip
+          else
+            cargo build --release --target "$TARGET" --bin cargo-vip
+          fi
+      - name: Reject native TLS and OpenSSL dependencies
+        run: |
+          set -euo pipefail
+          if grep -E '^name = "(openssl|openssl-sys|native-tls|rustls-native-certs|openssl-probe)"' Cargo.lock; then
+            echo "::error::an OpenSSL or system-trust-store crate entered the graph" >&2
+            exit 1
+          fi
+      - name: Package binary and checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="cargo-vip-$TARGET.tar.gz"
+          mkdir -p staging/bin dist
+          install -m 755 "target/$TARGET/release/cargo-vip" staging/bin/cargo-vip
+          tar -C staging -czf "dist/$archive" bin/cargo-vip
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$archive" > "$archive.sha256")
+          else
+            (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-vip-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [release-info, build]
+    if: needs.release-info.outputs.build == 'true'
+    runs-on: ubicloud-standard-2
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cargo-vip-*
+          merge-multiple: true
+      - name: Verify archives and checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-musl \
+            x86_64-unknown-linux-musl; do
+            archive="cargo-vip-$target.tar.gz"
+            sha256sum -c "$archive.sha256"
+            tar -tzf "$archive" | grep -qx 'bin/cargo-vip'
+          done
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.release-info.outputs.tag }}
+          name: ${{ needs.release-info.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          token: ${{ github.token }}
