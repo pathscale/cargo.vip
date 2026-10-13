@@ -28,6 +28,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Is this version published?
         id: decide
         run: |
@@ -61,4 +63,8 @@ jobs:
         if: steps.decide.outputs.publish == 'true'
         run: |
           git tag "v${{ steps.decide.outputs.version }}"
-          git push origin "v${{ steps.decide.outputs.version }}"
+      - name: Push the published tag
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "v${{ steps.decide.outputs.version }}"
