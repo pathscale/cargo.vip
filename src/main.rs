@@ -32,6 +32,7 @@ use reqwest::Client;
 use rusty_s3::actions::GetObject;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,9 +59,9 @@ const ISSUE_CREDENTIALS: u32 = 20030;
     about = "Use a private S3-compatible bucket as a Cargo registry"
 )]
 struct Args {
-    /// Registry name, as used in `registry = "…"` in Cargo.toml.
-    #[arg(long, env = "CARGO_VIP_REGISTRY", default_value = "vip")]
-    registry: String,
+    /// Registry name(s), as used in `registry = "..."` in Cargo.toml.
+    #[arg(long = "registry", env = "CARGO_VIP_REGISTRY", value_delimiter = ',')]
+    registry: Vec<String>,
 
     /// S3 endpoint. Defaults to Tigris; any S3-compatible store works.
     #[arg(
@@ -92,11 +93,14 @@ struct Args {
     #[arg(long, env = "CARGO_VIP_KEY_SECRET", hide_env_values = true)]
     key_secret: Option<String>,
 
-    /// A registry token in place of the saved token for the selected bucket;
-    /// CI passes one from a secret. A `ReadOnly` token builds; a `Publish`
-    /// token also runs `cargo vip publish`.
-    #[arg(long, env = "CARGO_VIP_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    /// Registry tokens, in precedence order.
+    #[arg(
+        long = "token",
+        env = "CARGO_VIP_TOKEN",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    token: Vec<String>,
 
     /// Serve the index and stay in the foreground, printing the config stanza,
     /// instead of running cargo.
@@ -135,6 +139,12 @@ struct FileConfig {
     registry: Vec<RegistryToken>,
 }
 
+impl FileConfig {
+    fn find_by_bucket(&self, bucket: &str) -> Option<&RegistryToken> {
+        self.registry.iter().find(|entry| entry.bucket == bucket)
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct RegistryToken {
     bucket: String,
@@ -144,6 +154,7 @@ struct RegistryToken {
 }
 
 /// What the registry needs to be read, however it was obtained.
+#[derive(Clone)]
 struct Resolved {
     key_id: String,
     key_secret: String,
@@ -217,13 +228,14 @@ fn source(args: &Args, file: &FileConfig, index: Option<&str>) -> Result<Source>
             bail!("--key-id and --key-secret must be given together")
         }
         (None, None) => {
+            let registry = args.registry.first().map_or("vip", String::as_str);
             let target_bucket = index
-                .map(|index| bucket_from_index(index, &args.registry))
+                .map(|index| bucket_from_index(index, registry))
                 .transpose()?
                 .flatten()
                 .or_else(|| args.bucket.clone());
 
-            if let Some(token) = args.token.clone() {
+            if let Some(token) = args.token.first().cloned() {
                 return Ok(Source::Broker {
                     url: args.broker.clone(),
                     token,
@@ -232,7 +244,7 @@ fn source(args: &Args, file: &FileConfig, index: Option<&str>) -> Result<Source>
                 });
             }
 
-            stored_token_source(file, &args.registry, target_bucket, &args.broker)
+            stored_token_source(file, registry, target_bucket, &args.broker)
         }
     }
 }
@@ -251,7 +263,7 @@ fn stored_token_source(
     };
 
     if let Some(bucket) = target_bucket {
-        if let Some(entry) = file.registry.iter().find(|entry| entry.bucket == bucket) {
+        if let Some(entry) = file.find_by_bucket(&bucket) {
             return Ok(Source::Broker {
                 url: broker_for(&entry.broker),
                 token: entry.token.clone(),
@@ -295,6 +307,305 @@ fn stored_token_source(
              in .cargo/config.toml or {} to select a bucket",
             index_env(registry)
         ),
+    }
+}
+
+fn is_crates_vip_index(index: &str) -> bool {
+    bucket_from_index(index, "vip").is_ok()
+}
+
+fn registries_in_toml(text: &str, origin_label: &str) -> Result<Vec<(String, String)>> {
+    let config: toml::Value =
+        toml::from_str(text).with_context(|| format!("parsing Cargo config {origin_label}"))?;
+    let Some(registries) = config.get("registries").and_then(toml::Value::as_table) else {
+        return Ok(Vec::new());
+    };
+    Ok(registries
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .get("index")
+                .and_then(toml::Value::as_str)
+                .map(|index| (name.clone(), index.to_owned()))
+        })
+        .collect())
+}
+
+fn discover_registries(
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    env_vars: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let mut found = BTreeMap::new();
+    for directory in cwd.ancestors() {
+        let cargo_dir = directory.join(".cargo");
+        for name in ["config.toml", "config"] {
+            let path = cargo_dir.join(name);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    for (registry, index) in registries_in_toml(&text, &path.display().to_string())?
+                    {
+                        found.entry(registry).or_insert(index);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            }
+        }
+    }
+    if let Some(home) = cargo_home {
+        for name in ["config.toml", "config"] {
+            let path = home.join(name);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    for (registry, index) in registries_in_toml(&text, &path.display().to_string())?
+                    {
+                        found.entry(registry).or_insert(index);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            }
+        }
+    }
+    for (key, value) in env_vars {
+        if let Some(upper) = key
+            .strip_prefix("CARGO_REGISTRIES_")
+            .and_then(|s| s.strip_suffix("_INDEX"))
+        {
+            if !is_crates_vip_index(value) {
+                continue;
+            }
+            if let Some(name) = found
+                .keys()
+                .find(|name| name.to_uppercase().replace('-', "_") == upper)
+                .cloned()
+            {
+                found.insert(name, value.clone());
+            } else {
+                found.insert(upper.to_lowercase(), value.clone());
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .filter(|(_, index)| is_crates_vip_index(index))
+        .collect())
+}
+
+type ActiveRegistryPlan = (Vec<(String, Option<String>)>, Option<String>);
+
+fn select_active_registries(
+    explicit: &[String],
+    discovered: &[(String, String)],
+    is_publish: bool,
+) -> Result<ActiveRegistryPlan> {
+    let indexes: BTreeMap<_, _> = discovered.iter().cloned().collect();
+    if is_publish {
+        if explicit.len() > 1 {
+            bail!("cargo vip publish takes a single --registry");
+        }
+        let target = if let Some(name) = explicit.first() {
+            name.clone()
+        } else if discovered.is_empty() || discovered.iter().any(|(name, _)| name == "vip") {
+            "vip".to_owned()
+        } else if discovered.len() == 1 {
+            discovered[0].0.clone()
+        } else {
+            bail!(
+                "multiple registries configured; pass --registry <NAME> to select which registry to publish to"
+            );
+        };
+        let mut active = vec![(target.clone(), indexes.get(&target).cloned())];
+        active.extend(
+            discovered
+                .iter()
+                .filter(|(name, _)| name != &target)
+                .map(|(name, index)| (name.clone(), Some(index.clone()))),
+        );
+        Ok((active, Some(target)))
+    } else if !explicit.is_empty() {
+        Ok((
+            explicit
+                .iter()
+                .map(|name| (name.clone(), indexes.get(name).cloned()))
+                .collect(),
+            None,
+        ))
+    } else if !discovered.is_empty() {
+        Ok((
+            discovered
+                .iter()
+                .map(|(name, index)| (name.clone(), Some(index.clone())))
+                .collect(),
+            None,
+        ))
+    } else {
+        Ok((vec![("vip".to_owned(), None)], None))
+    }
+}
+
+fn token_env(registry: &str) -> String {
+    format!(
+        "CARGO_VIP_TOKEN_{}",
+        registry.to_uppercase().replace('-', "_")
+    )
+}
+
+fn parse_tokens(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut tokens = Vec::new();
+    for token in raw
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if seen.insert(token.to_owned()) {
+            tokens.push(token.to_owned());
+        }
+    }
+    tokens
+}
+
+fn collect_candidate_tokens(
+    cli_tokens: &[String],
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in cli_tokens
+        .iter()
+        .cloned()
+        .chain(env_lookup("CARGO_VIP_TOKENS"))
+        .chain(env_lookup("CARGO_VIP_TOKEN"))
+    {
+        for token in parse_tokens(&raw) {
+            if seen.insert(token.clone()) {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
+}
+
+fn resolve_static_key(args: &Args, file: &FileConfig) -> Result<Option<Resolved>> {
+    let key_id = args.key_id.clone().or(file.key_id.clone());
+    let key_secret = args.key_secret.clone().or(file.key_secret.clone());
+    if key_id.is_none() && key_secret.is_none() {
+        return Ok(None);
+    }
+    let (Some(key_id), Some(key_secret)) = (key_id, key_secret) else {
+        bail!("--key-id and --key-secret must be given together");
+    };
+    let bucket = args
+        .bucket
+        .clone()
+        .or(file.bucket.clone())
+        .context("an explicit key needs --bucket or CARGO_VIP_BUCKET")?;
+    Ok(Some(Resolved {
+        key_id,
+        key_secret,
+        bucket,
+        endpoint: file
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| args.endpoint.clone()),
+        region: file.region.clone().unwrap_or_else(|| args.region.clone()),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_registry_with(
+    args: &Args,
+    file: &FileConfig,
+    registry_name: &str,
+    index_opt: Option<&str>,
+    candidate_tokens: &[String],
+    per_registry_token: Option<&str>,
+    active_count: usize,
+    mut exchange: impl FnMut(&str, &str) -> Result<Resolved>,
+) -> Result<Resolved> {
+    if let Some(resolved) = resolve_static_key(args, file)? {
+        return Ok(resolved);
+    }
+    let expected_bucket = index_opt
+        .map(|index| bucket_from_index(index, registry_name))
+        .transpose()?
+        .flatten()
+        .or_else(|| args.bucket.clone());
+    let cli_broker = &args.broker;
+    let file_broker = file.broker.as_deref().unwrap_or(&args.broker);
+    if let Some(token) = per_registry_token.filter(|token| !token.is_empty()) {
+        let resolved = exchange(cli_broker, token)?;
+        if let Some(bucket) = expected_bucket.as_deref() {
+            if resolved.bucket != bucket {
+                bail!(
+                    "the selected token resolves to bucket `{}`, but registry `{}` is configured for bucket `{}`",
+                    resolved.bucket,
+                    registry_name,
+                    bucket
+                );
+            }
+        }
+        return Ok(resolved);
+    }
+    if let Some(bucket) = expected_bucket.as_deref() {
+        let mut last_bucket = None;
+        for token in candidate_tokens {
+            let resolved = exchange(cli_broker, token)?;
+            if resolved.bucket == bucket {
+                return Ok(resolved);
+            }
+            last_bucket = Some(resolved.bucket);
+        }
+        if let Some(entry) = file.find_by_bucket(bucket) {
+            return exchange(entry.broker.as_deref().unwrap_or(file_broker), &entry.token);
+        }
+        if let Some(token) = &file.token {
+            let resolved = exchange(file_broker, token)?;
+            if resolved.bucket != bucket {
+                bail!("{}", missing_token_message(bucket));
+            }
+            return Ok(resolved);
+        }
+        if let Some(other_bucket) = last_bucket {
+            bail!(
+                "the selected token resolves to bucket `{other_bucket}`, but registry `{registry_name}` is configured for bucket `{bucket}`"
+            );
+        }
+        return Err(anyhow::anyhow!(missing_token_message(bucket)));
+    }
+    if active_count == 1 {
+        if let Some(token) = candidate_tokens.first() {
+            return exchange(cli_broker, token);
+        }
+    }
+    match source(args, file, index_opt)? {
+        Source::Static(resolved) => Ok(resolved),
+        Source::Broker {
+            url,
+            token,
+            expected_bucket,
+            legacy,
+        } => {
+            let resolved = exchange(&url, &token)?;
+            if let Some(expected_bucket) = expected_bucket {
+                if resolved.bucket != expected_bucket {
+                    if legacy {
+                        bail!("{}", missing_token_message(&expected_bucket));
+                    }
+                    bail!(
+                        "the selected token resolves to bucket `{}`, but registry `{registry_name}` is configured for bucket `{expected_bucket}`",
+                        resolved.bucket
+                    );
+                }
+            }
+            Ok(resolved)
+        }
     }
 }
 
@@ -562,7 +873,7 @@ async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
             .get(name)
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned)
-            .with_context(|| format!("the registry did not return {name}: {reply}"))
+            .with_context(|| format!("the registry did not return {name}"))
     };
 
     Ok(Resolved {
@@ -621,56 +932,190 @@ impl Registry {
     }
 }
 
-/// The key this run uses: explicit, or issued by the broker for the bucket the
-/// registry is configured for.
-async fn resolve(args: &Args, file: &FileConfig) -> Result<Resolved> {
-    let index = if args.key_id.is_some()
+struct ActiveProxy {
+    name: String,
+    stable: String,
+    loopback: String,
+    registry: Arc<Registry>,
+}
+
+fn wanted_broker_tokens(
+    args: &Args,
+    file: &FileConfig,
+    name: &str,
+    index: Option<&str>,
+    specific: Option<&str>,
+    candidates: &[String],
+    active_count: usize,
+) -> Result<Vec<(String, String)>> {
+    let cli_broker = &args.broker;
+    let file_broker = file.broker.as_deref().unwrap_or(&args.broker);
+    let expected_bucket = index
+        .map(|value| bucket_from_index(value, name))
+        .transpose()?
+        .flatten()
+        .or_else(|| args.bucket.clone());
+    let mut wanted = Vec::new();
+    if let Some(token) = specific.filter(|token| !token.is_empty()) {
+        wanted.push((cli_broker.to_owned(), token.to_owned()));
+    } else if let Some(bucket) = expected_bucket.as_deref() {
+        wanted.extend(
+            candidates
+                .iter()
+                .map(|token| (cli_broker.to_owned(), token.clone())),
+        );
+        if let Some(entry) = file.find_by_bucket(bucket) {
+            wanted.push((
+                entry.broker.as_deref().unwrap_or(file_broker).to_owned(),
+                entry.token.clone(),
+            ));
+        } else if let Some(token) = &file.token {
+            wanted.push((file_broker.to_owned(), token.clone()));
+        }
+    } else if active_count == 1 && !candidates.is_empty() {
+        wanted.push((cli_broker.to_owned(), candidates[0].clone()));
+    } else if let Source::Broker { url, token, .. } = source(args, file, index)? {
+        wanted.push((url, token));
+    }
+    Ok(wanted)
+}
+
+/// The keys this run uses: explicit, or issued by the broker for each active
+/// registry's configured bucket.
+async fn resolve_active_registries(
+    args: &Args,
+    file: &FileConfig,
+) -> Result<(Vec<(String, Resolved)>, Option<String>)> {
+    let is_publish = args.cargo_args.first().is_some_and(|arg| arg == "publish");
+    let cwd = std::env::current_dir().context("getting the current directory")?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    let env_vars: Vec<(String, String)> = std::env::vars().collect();
+    let discovered = discover_registries(&cwd, cargo_home.as_deref(), &env_vars)?;
+    let (mut active, publish_target) =
+        select_active_registries(&args.registry, &discovered, is_publish)?;
+    let static_key = args.key_id.is_some()
         || args.key_secret.is_some()
         || file.key_id.is_some()
-        || file.key_secret.is_some()
-    {
-        None
-    } else {
-        cargo_registry_index(&args.registry)?
-    };
-    Ok(match source(args, file, index.as_deref())? {
-        Source::Static(resolved) => resolved,
-        Source::Broker {
-            url,
-            token,
-            expected_bucket,
-            legacy,
-        } => {
-            let resolved = match issue_credentials(&url, &token).await {
-                Ok(resolved) => resolved,
-                Err(error) if legacy && expected_bucket.is_some() => {
-                    return Err(error.context(missing_token_message(
-                        expected_bucket.as_deref().unwrap_or_default(),
-                    )));
-                }
-                Err(error) if legacy => {
-                    return Err(error.context(
-                        "the saved single-token credentials could not be used; run `cargo vip login` to replace them",
-                    ));
-                }
-                Err(error) => return Err(error),
-            };
-            if let Some(expected_bucket) = expected_bucket {
-                if resolved.bucket != expected_bucket {
-                    if legacy {
-                        bail!("{}", missing_token_message(&expected_bucket));
+        || file.key_secret.is_some();
+    if !static_key {
+        for (name, index) in &mut active {
+            if index.is_none() {
+                *index = cargo_registry_index(name)?;
+            }
+        }
+    }
+    let candidates = collect_candidate_tokens(&args.token, |key| std::env::var(key).ok());
+    let mut cache: BTreeMap<(String, String), Resolved> = BTreeMap::new();
+    let active_count = active.len();
+    let mut result = Vec::new();
+    for (name, index) in active {
+        let specific = std::env::var(token_env(&name)).ok();
+        let can_skip = is_publish
+            && !args.registry.is_empty()
+            && publish_target.as_deref() != Some(name.as_str());
+        if !static_key {
+            let wanted = wanted_broker_tokens(
+                args,
+                file,
+                &name,
+                index.as_deref(),
+                specific.as_deref(),
+                &candidates,
+                active_count,
+            )?;
+            let mut skip_registry = false;
+            for (url, token) in wanted {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    cache.entry((url.clone(), token.clone()))
+                {
+                    match issue_credentials(&url, &token).await {
+                        Ok(credentials) => {
+                            entry.insert(credentials);
+                        }
+                        Err(error) if can_skip => {
+                            tracing::warn!(registry = %name, error = %error,
+                                "skipping registry whose credentials could not be resolved for publish");
+                            skip_registry = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    bail!(
-                        "the selected token resolves to bucket `{}`, but registry `{}` is configured for bucket `{}`",
-                        resolved.bucket,
-                        args.registry,
-                        expected_bucket
-                    );
                 }
             }
-            resolved
+            if skip_registry {
+                continue;
+            }
         }
-    })
+        let resolved = resolve_registry_with(
+            args,
+            file,
+            &name,
+            index.as_deref(),
+            &candidates,
+            specific.as_deref(),
+            active_count,
+            |broker, token| {
+                cache
+                    .get(&(broker.to_owned(), token.to_owned()))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("credential exchange was not prepared"))
+            },
+        );
+        match resolved {
+            Ok(credentials) => result.push((name, credentials)),
+            Err(error) if can_skip => {
+                tracing::warn!(registry = %name, error = %error,
+                    "skipping registry whose credentials could not be resolved for publish");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((result, publish_target))
+}
+
+async fn start_proxies(
+    resolved: Vec<(String, Resolved)>,
+) -> Result<(Vec<ActiveProxy>, Vec<tokio::task::JoinHandle<()>>)> {
+    let client = Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("building the HTTP client")?;
+    let mut proxies = Vec::new();
+    let mut serving = Vec::new();
+    for (name, resolved) in resolved {
+        // Loopback only. The key lives in this process and nothing off the machine
+        // should be able to borrow it.
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .context("binding the loopback listener")?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let registry = Arc::new(Registry {
+            client: client.clone(),
+            credentials: Credentials::new(resolved.key_id, resolved.key_secret),
+            // Path style, which is what S3-compatible stores serve.
+            bucket: Bucket::new(
+                resolved
+                    .endpoint
+                    .parse()
+                    .with_context(|| format!("parsing {}", resolved.endpoint))?,
+                UrlStyle::Path,
+                resolved.bucket,
+                resolved.region,
+            )
+            .context("building the bucket")?,
+            origin: origin.clone(),
+        });
+        serving.push(tokio::spawn(serve(listener, Arc::clone(&registry))));
+        proxies.push(ActiveProxy {
+            name,
+            stable: format!("sparse+https://crates.vip/{}/", registry.bucket.name()),
+            loopback: format!("sparse+{origin}/"),
+            registry,
+        });
+    }
+    Ok((proxies, serving))
 }
 
 #[tokio::main]
@@ -694,60 +1139,50 @@ async fn main() -> Result<()> {
         return login(&args.broker, file).await;
     }
 
-    let resolved = resolve(&args, &file).await?;
-    let (key_id, key_secret, bucket_name, endpoint, region) = (
-        resolved.key_id,
-        resolved.key_secret,
-        resolved.bucket,
-        resolved.endpoint,
-        resolved.region,
-    );
+    let (resolved, publish_target) = resolve_active_registries(&args, &file).await?;
+    let (proxies, serving) = start_proxies(resolved).await?;
+    let triples: Vec<(String, String, String)> = proxies
+        .iter()
+        .map(|proxy| {
+            (
+                proxy.name.clone(),
+                proxy.stable.clone(),
+                proxy.loopback.clone(),
+            )
+        })
+        .collect();
+    let config = cargo_config_all(&triples);
+    let envs = cargo_env_all(&triples);
 
-    // Loopback only. The key lives in this process and nothing off the machine
-    // should be able to borrow it.
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .context("binding the loopback listener")?;
-    let origin = format!("http://{}", listener.local_addr()?);
-
-    let registry = Arc::new(Registry {
-        client: Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building the HTTP client")?,
-        credentials: Credentials::new(key_id, key_secret),
-        // Path style, which is what S3-compatible stores serve.
-        bucket: Bucket::new(
-            endpoint
-                .parse()
-                .with_context(|| format!("parsing {endpoint}"))?,
-            UrlStyle::Path,
-            bucket_name,
-            region,
-        )
-        .context("building the bucket")?,
-        origin: origin.clone(),
-    });
-
-    let serving = tokio::spawn(serve(listener, Arc::clone(&registry)));
-    let loopback = format!("sparse+{origin}/");
-    // What crates and lockfiles name the registry by. Never fetched: cargo
-    // replaces it with the loopback source, and records the stable URL, so a
-    // lockfile and a packaged crate do not change with this run's port.
-    let stable = format!("sparse+https://crates.vip/{}/", registry.bucket.name());
-    let config = cargo_config(&args.registry, &stable, &loopback);
-
+    if args.cargo_args.first().is_some_and(|arg| arg == "env") {
+        print!("{}", env_exports(&triples));
+        if args.serve {
+            tokio::signal::ctrl_c().await?;
+        }
+        for task in serving {
+            task.abort();
+        }
+        return Ok(());
+    }
     if args.serve {
-        println!("[registries.{}]", args.registry);
-        println!("index = \"{stable}\"");
-        println!();
-        println!("[source.{}-remote]", args.registry);
-        println!("registry = \"{stable}\"");
-        println!("replace-with = \"{}-loopback\"", args.registry);
-        println!();
-        println!("[source.{}-loopback]", args.registry);
-        println!("registry = \"{loopback}\"");
+        for (i, proxy) in proxies.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            println!("[registries.{}]", proxy.name);
+            println!("index = \"{}\"", proxy.stable);
+            println!();
+            println!("[source.{}-remote]", proxy.name);
+            println!("registry = \"{}\"", proxy.stable);
+            println!("replace-with = \"{}-loopback\"", proxy.name);
+            println!();
+            println!("[source.{}-loopback]", proxy.name);
+            println!("registry = \"{}\"", proxy.loopback);
+        }
         tokio::signal::ctrl_c().await?;
+        for task in serving {
+            task.abort();
+        }
         return Ok(());
     }
 
@@ -756,14 +1191,26 @@ async fn main() -> Result<()> {
     }
 
     if args.cargo_args.first().is_some_and(|a| a == "publish") {
-        let request = publish_request(&args.cargo_args[1..], &args.registry, &stable)?;
+        let target_name = publish_target.as_deref().unwrap_or("vip");
+        let proxy = proxies
+            .iter()
+            .find(|proxy| proxy.name == target_name)
+            .context("publish registry proxy was not resolved")?;
+        let loopbacks: Vec<(String, String)> = proxies
+            .iter()
+            .map(|proxy| (proxy.loopback.clone(), proxy.stable.clone()))
+            .collect();
+        let request =
+            publish_request(&args.cargo_args[1..], &proxy.name, &proxy.stable, loopbacks)?;
         let target = publish::Target {
-            client: &registry.client,
-            bucket: &registry.bucket,
-            credentials: &registry.credentials,
+            client: &proxy.registry.client,
+            bucket: &proxy.registry.bucket,
+            credentials: &proxy.registry.credentials,
         };
         let outcome = publish::publish(&target, &request, &config).await;
-        serving.abort();
+        for task in serving {
+            task.abort();
+        }
         return outcome;
     }
 
@@ -778,14 +1225,16 @@ async fn main() -> Result<()> {
     // loopback.
     let status =
         tokio::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .env(index_env(&args.registry), &loopback)
+            .envs(envs)
             .args(&config)
             .args(&args.cargo_args)
             .status()
             .await
             .context("running cargo")?;
 
-    serving.abort();
+    for task in serving {
+        task.abort();
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -811,8 +1260,45 @@ fn cargo_config(registry: &str, stable: &str, loopback: &str) -> Vec<String> {
     .collect()
 }
 
+fn cargo_config_all(proxies: &[(String, String, String)]) -> Vec<String> {
+    let mut config = Vec::new();
+    let mut stable_sources = std::collections::BTreeSet::new();
+    for (name, stable, loopback) in proxies {
+        let mut registry_config = cargo_config(name, stable, loopback);
+        if !stable_sources.insert(stable.clone()) {
+            registry_config.retain(|arg| !arg.starts_with(&format!("source.{name}-remote.")));
+        }
+        config.extend(registry_config);
+    }
+    config
+}
+
+fn cargo_env_all(proxies: &[(String, String, String)]) -> Vec<(String, String)> {
+    proxies
+        .iter()
+        .map(|(name, _, loopback)| (index_env(name), loopback.clone()))
+        .collect()
+}
+
+fn env_exports(proxies: &[(String, String, String)]) -> String {
+    let mut out = String::new();
+    for (name, _, loopback) in proxies {
+        out.push_str("export ");
+        out.push_str(&index_env(name));
+        out.push_str("=\"");
+        out.push_str(loopback);
+        out.push_str("\"\n");
+    }
+    out
+}
+
 /// `cargo vip publish [--manifest-path PATH] [--dry-run]`.
-fn publish_request(rest: &[String], registry: &str, index_url: &str) -> Result<publish::Request> {
+fn publish_request(
+    rest: &[String],
+    registry: &str,
+    index_url: &str,
+    loopbacks: Vec<(String, String)>,
+) -> Result<publish::Request> {
     let mut manifest_path = PathBuf::from("Cargo.toml");
     let mut dry_run = false;
     let mut rest = rest.iter();
@@ -833,6 +1319,7 @@ fn publish_request(rest: &[String], registry: &str, index_url: &str) -> Result<p
         dry_run,
         registry: registry.to_owned(),
         index_url: index_url.to_owned(),
+        loopbacks,
     })
 }
 
@@ -966,14 +1453,14 @@ mod tests {
 
     fn args() -> Args {
         Args {
-            registry: "vip".to_owned(),
+            registry: vec!["vip".to_owned()],
             endpoint: "https://fly.storage.tigris.dev".to_owned(),
             region: "auto".to_owned(),
             bucket: None,
             broker: "wss://api.crates.vip".to_owned(),
             key_id: None,
             key_secret: None,
-            token: None,
+            token: Vec::new(),
             serve: false,
             cargo_args: Vec::new(),
         }
@@ -1056,7 +1543,7 @@ mod tests {
         let mut file = FileConfig::default();
         save_registry_token(&mut file, "alpha", "alpha-token", "wss://alpha.example");
         let mut args = args();
-        args.token = Some("ci-token".to_owned());
+        args.token = vec!["ci-token".to_owned()];
 
         let selected = source(&args, &file, Some("sparse+https://crates.vip/beta/")).unwrap();
         match selected {
@@ -1066,6 +1553,185 @@ mod tests {
             }
             Source::Static(_) => panic!("expected broker credentials"),
         }
+    }
+
+    #[test]
+    fn discovers_multiple_crates_vip_registries_from_config_and_env() {
+        let root = test_directory();
+        let cargo = root.join(".cargo");
+        fs::create_dir_all(&cargo).unwrap();
+        fs::write(cargo.join("config.toml"),
+            "[registries.bucket-a]\nindex = \"sparse+https://crates.vip/bucket-a/\"\n[registries.bucket-b]\nindex = \"sparse+https://crates.vip/bucket-b/\"\n[registries.other]\nindex = \"sparse+https://example.com/index/\"\n").unwrap();
+        let parsed = super::registries_in_toml(
+            &fs::read_to_string(cargo.join("config.toml")).unwrap(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        let env = vec![(
+            "CARGO_REGISTRIES_UPSTREAM_INDEX".to_owned(),
+            "sparse+https://crates.vip/upstream/".to_owned(),
+        )];
+        let found = super::discover_registries(&root, None, &env).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "bucket-a".to_owned(),
+                    "sparse+https://crates.vip/bucket-a/".to_owned()
+                ),
+                (
+                    "bucket-b".to_owned(),
+                    "sparse+https://crates.vip/bucket-b/".to_owned()
+                ),
+                (
+                    "upstream".to_owned(),
+                    "sparse+https://crates.vip/upstream/".to_owned()
+                ),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolves_tokens_from_per_registry_env_and_bucket_matched_pool_and_saved_config() {
+        let args = args();
+        let tokens = super::collect_candidate_tokens(&[], |key| {
+            (key == "CARGO_VIP_TOKENS").then(|| "cvip_test_a,cvip_test_b".to_owned())
+        });
+        assert_eq!(tokens, vec!["cvip_test_a", "cvip_test_b"]);
+        let resolved = super::resolve_registry_with(
+            &args,
+            &FileConfig::default(),
+            "bucket-a",
+            Some("sparse+https://crates.vip/bucket-a/"),
+            &tokens,
+            Some("per-registry-token"),
+            2,
+            |_, token| {
+                assert_eq!(token, "per-registry-token");
+                Ok(super::Resolved {
+                    key_id: "id".into(),
+                    key_secret: "secret".into(),
+                    bucket: "bucket-a".into(),
+                    endpoint: args.endpoint.clone(),
+                    region: args.region.clone(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.bucket, "bucket-a");
+    }
+
+    #[test]
+    fn matches_shared_tokens_to_buckets_and_falls_back_to_saved_bucket_token() {
+        let args = args();
+        let mut file = FileConfig::default();
+        save_registry_token(&mut file, "bucket-b", "saved-b", "wss://saved.example");
+        let pool = vec!["cvip_test_a".to_owned(), "cvip_test_b".to_owned()];
+        let resolved_a = super::resolve_registry_with(
+            &args,
+            &FileConfig::default(),
+            "alpha",
+            Some("sparse+https://crates.vip/bucket-a/"),
+            &pool,
+            None,
+            2,
+            |_, token| {
+                Ok(super::Resolved {
+                    key_id: "id".into(),
+                    key_secret: "secret".into(),
+                    bucket: if token == "cvip_test_a" {
+                        "bucket-a"
+                    } else {
+                        "bucket-b"
+                    }
+                    .into(),
+                    endpoint: args.endpoint.clone(),
+                    region: args.region.clone(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved_a.bucket, "bucket-a");
+        let resolved_b = super::resolve_registry_with(
+            &args,
+            &file,
+            "beta",
+            Some("sparse+https://crates.vip/bucket-b/"),
+            &[],
+            None,
+            2,
+            |_, token| {
+                assert_eq!(token, "saved-b");
+                Ok(super::Resolved {
+                    key_id: "id".into(),
+                    key_secret: "secret".into(),
+                    bucket: "bucket-b".into(),
+                    endpoint: args.endpoint.clone(),
+                    region: args.region.clone(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved_b.bucket, "bucket-b");
+    }
+
+    #[test]
+    fn merges_cargo_config_and_env_for_multiple_registries() {
+        let triples = vec![
+            (
+                "vip".to_owned(),
+                "sparse+https://crates.vip/bucket-a/".to_owned(),
+                "sparse+http://127.0.0.1:1/".to_owned(),
+            ),
+            (
+                "upstream".to_owned(),
+                "sparse+https://crates.vip/bucket-b/".to_owned(),
+                "sparse+http://127.0.0.1:2/".to_owned(),
+            ),
+        ];
+        let config = super::cargo_config_all(&triples);
+        assert!(
+            config
+                .iter()
+                .any(|value| value.contains("registries.vip.index"))
+        );
+        assert!(
+            config
+                .iter()
+                .any(|value| value.contains("registries.upstream.index"))
+        );
+        assert_eq!(super::cargo_env_all(&triples).len(), 2);
+        assert!(super::env_exports(&triples).contains("CARGO_REGISTRIES_UPSTREAM_INDEX"));
+    }
+
+    #[test]
+    fn selects_publish_target_across_multiple_registries() {
+        let discovered = vec![
+            (
+                "upstream".to_owned(),
+                "sparse+https://crates.vip/bucket-b/".to_owned(),
+            ),
+            (
+                "vip".to_owned(),
+                "sparse+https://crates.vip/bucket-a/".to_owned(),
+            ),
+        ];
+        let (active, target) = super::select_active_registries(&[], &discovered, true).unwrap();
+        assert_eq!(target.as_deref(), Some("vip"));
+        assert!(active.iter().any(|(name, _)| name == "upstream"));
+        let (_, explicit) =
+            super::select_active_registries(&["upstream".to_owned()], &discovered, true).unwrap();
+        assert_eq!(explicit.as_deref(), Some("upstream"));
+        let only_other = vec![
+            discovered[0].clone(),
+            (
+                "second".to_owned(),
+                "sparse+https://crates.vip/bucket-c/".to_owned(),
+            ),
+        ];
+        assert!(super::select_active_registries(&[], &only_other, true).is_err());
     }
 
     #[test]

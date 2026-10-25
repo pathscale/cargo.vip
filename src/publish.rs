@@ -53,6 +53,8 @@ pub struct Request {
     /// The index URL this process serves the registry at, which is how
     /// `cargo metadata` reports a dependency on another crate in it.
     pub index_url: String,
+    /// Loopback index URLs paired with the stable URLs for active registries.
+    pub loopbacks: Vec<(String, String)>,
 }
 
 /// # Errors
@@ -96,7 +98,7 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
     let tarball = std::fs::read(&tarball_path)
         .with_context(|| format!("reading {}", tarball_path.display()))?;
     let cksum = hex::encode(Sha256::digest(&tarball));
-    let entry = package.index_entry(&cksum, &req.index_url)?;
+    let entry = package.index_entry(&cksum, &req.index_url, &req.loopbacks)?;
 
     if req.dry_run {
         tracing::info!("registry bucket {} (the token's app)", target.bucket.name());
@@ -344,7 +346,12 @@ impl Package {
         }
     }
 
-    fn index_entry(&self, cksum: &str, own_index: &str) -> Result<Value> {
+    fn index_entry(
+        &self,
+        cksum: &str,
+        own_index: &str,
+        loopbacks: &[(String, String)],
+    ) -> Result<Value> {
         // `dep:` and `pkg?/feat` go in features2, so a cargo too old to parse
         // them skips the field instead of failing on the whole entry.
         let (features2, features): (BTreeMap<_, _>, BTreeMap<_, _>) = self
@@ -359,7 +366,7 @@ impl Package {
         let deps = self
             .dependencies
             .iter()
-            .map(|d| d.index_dependency(own_index))
+            .map(|d| d.index_dependency(own_index, loopbacks))
             .collect::<Result<Vec<_>>>()?;
         Ok(without_nulls(json!({
             "name": self.name,
@@ -377,7 +384,7 @@ impl Package {
 }
 
 impl MetadataDependency {
-    fn index_dependency(&self, own_index: &str) -> Result<Value> {
+    fn index_dependency(&self, own_index: &str, loopbacks: &[(String, String)]) -> Result<Value> {
         let kind = match self.kind.as_deref() {
             None | Some("normal") => "normal",
             Some("dev") => "dev",
@@ -395,7 +402,14 @@ impl MetadataDependency {
         // cargo reports for it names this machine, not the registry.
         let registry = match self.registry.as_deref() {
             Some(index) if same_index(index, own_index) => None,
-            Some(index) => Some(index.to_owned()),
+            Some(index) => match loopbacks
+                .iter()
+                .find(|(loopback, stable)| same_index(index, loopback) || same_index(index, stable))
+            {
+                Some((_, stable)) if same_index(stable, own_index) => None,
+                Some((_, stable)) => Some(stable.clone()),
+                None => Some(index.to_owned()),
+            },
             None => Some(CRATES_IO_INDEX.to_owned()),
         };
         let mut features = self.features.clone();
@@ -426,7 +440,7 @@ fn without_nulls(mut value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_path, same_index};
+    use super::{MetadataDependency, Package, index_path, same_index};
 
     #[test]
     fn index_paths_follow_the_sparse_layout() {
@@ -434,6 +448,60 @@ mod tests {
         assert_eq!(index_path("ab"), "2/ab");
         assert_eq!(index_path("abc"), "3/a/abc");
         assert_eq!(index_path("Pays-Hash"), "pa/ys/pays-hash");
+    }
+
+    #[test]
+    fn index_entry_maps_secondary_loopback_and_omits_own_registry() {
+        let own_index = "sparse+https://crates.vip/own/";
+        let secondary_loopback = "sparse+http://127.0.0.1:5001/";
+        let secondary_stable = "sparse+https://crates.vip/secondary/";
+        let package = Package {
+            manifest_path: std::path::PathBuf::new(),
+            name: "consumer".to_owned(),
+            version: "1.0.0".to_owned(),
+            features: std::collections::BTreeMap::new(),
+            links: None,
+            rust_version: None,
+            publish: None,
+            dependencies: vec![
+                MetadataDependency {
+                    name: "secondary-dependency".to_owned(),
+                    req: "*".to_owned(),
+                    kind: None,
+                    optional: false,
+                    uses_default_features: true,
+                    features: Vec::new(),
+                    target: None,
+                    rename: None,
+                    registry: Some(secondary_loopback.to_owned()),
+                },
+                MetadataDependency {
+                    name: "own-dependency".to_owned(),
+                    req: "*".to_owned(),
+                    kind: None,
+                    optional: false,
+                    uses_default_features: true,
+                    features: Vec::new(),
+                    target: None,
+                    rename: None,
+                    registry: Some(own_index.to_owned()),
+                },
+            ],
+        };
+        let loopbacks = vec![
+            (
+                "sparse+http://127.0.0.1:5000/".to_owned(),
+                own_index.to_owned(),
+            ),
+            (secondary_loopback.to_owned(), secondary_stable.to_owned()),
+        ];
+
+        let entry = package
+            .index_entry("checksum", own_index, &loopbacks)
+            .unwrap();
+
+        assert_eq!(entry["deps"][0]["registry"], secondary_stable);
+        assert!(entry["deps"][1].get("registry").is_none());
     }
 
     #[test]
