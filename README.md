@@ -62,6 +62,27 @@ cargo vip test
 cargo vip update
 ```
 
+### Using a build driver
+
+For `build` and `check`, you can select an executable to receive the Cargo arguments while
+`cargo.vip` keeps the registry proxies active:
+
+```sh
+cargo vip --build-driver /path/to/build-driver build --release
+CARGO_VIP_BUILD_DRIVER=/path/to/build-driver cargo vip check
+```
+
+The driver is started directly, without a shell, with the original arguments (`build`,
+`--release`, and so on). `CARGO_VIP_CARGO_CONFIG_JSON` contains a JSON array of strings: the
+Cargo `--config` arguments that point each selected registry at its loopback proxy. The driver
+also receives the registry index environment variables and inherits the caller's environment,
+including `CARGO` when set. It is responsible for interpreting the JSON configuration. Its exit
+status becomes the `cargo vip` exit status.
+
+Selecting a build driver supports only `build` and `check`; `test`, `publish`, `login`, `env`,
+and other commands fail with an error instead of falling back to Cargo. Without a selected
+driver, the existing Cargo invocation is unchanged.
+
 With one saved token, the wrapper can select it without a registry index in
 Cargo config. When you have tokens for multiple products, add an index entry to
 each repository so `cargo vip` knows which bucket that project uses.
