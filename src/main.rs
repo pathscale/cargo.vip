@@ -107,6 +107,13 @@ struct Args {
     #[arg(long)]
     serve: bool,
 
+    /// Run this executable for `build` or `check` instead of Cargo.
+    ///
+    /// The driver receives the original Cargo arguments and registry configuration in
+    /// `CARGO_VIP_CARGO_CONFIG_JSON`. `CARGO_VIP_BUILD_DRIVER` is the environment equivalent.
+    #[arg(long, env = "CARGO_VIP_BUILD_DRIVER", value_name = "EXECUTABLE")]
+    build_driver: Option<PathBuf>,
+
     /// The cargo invocation to wrap, e.g. `cargo vip build --release`.
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1118,6 +1125,30 @@ async fn start_proxies(
     Ok((proxies, serving))
 }
 
+/// Do not silently send a non-build command back to Cargo when a build driver is selected.
+fn validate_build_driver_request(args: &Args) -> Result<()> {
+    if args.build_driver.is_none() {
+        return Ok(());
+    }
+    if args
+        .build_driver
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        bail!("--build-driver must name an executable");
+    }
+    if args.serve {
+        bail!("--build-driver cannot be combined with --serve");
+    }
+    match args.cargo_args.first().map(String::as_str) {
+        Some("build" | "check") => Ok(()),
+        Some(command) => {
+            bail!("--build-driver supports only `build` and `check`; `{command}` is unsupported")
+        }
+        None => bail!("--build-driver needs a `build` or `check` command"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1133,6 +1164,7 @@ async fn main() -> Result<()> {
         .map(|(_, a)| a)
         .collect();
     let args = Args::parse_from(raw);
+    validate_build_driver_request(&args)?;
     let file = load_file_config()?;
 
     if args.cargo_args.first().is_some_and(|a| a == "login") {
@@ -1223,14 +1255,25 @@ async fn main() -> Result<()> {
     // through the environment, which `--config` outranks for built-in
     // commands; only an external one sees it, and its lockfile then names the
     // loopback.
-    let status =
+    let status = if let Some(driver) = &args.build_driver {
+        let config_json = serde_json::to_string(&config)
+            .context("serializing Cargo registry configuration for the build driver")?;
+        tokio::process::Command::new(driver)
+            .envs(envs)
+            .env("CARGO_VIP_CARGO_CONFIG_JSON", config_json)
+            .args(&args.cargo_args)
+            .status()
+            .await
+            .with_context(|| format!("running configured build driver `{}`", driver.display()))?
+    } else {
         tokio::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .envs(envs)
             .args(&config)
             .args(&args.cargo_args)
             .status()
             .await
-            .context("running cargo")?;
+            .context("running cargo")?
+    };
 
     for task in serving {
         task.abort();
@@ -1462,6 +1505,7 @@ mod tests {
             key_secret: None,
             token: Vec::new(),
             serve: false,
+            build_driver: None,
             cargo_args: Vec::new(),
         }
     }
