@@ -13,8 +13,6 @@ name: publish
 # skipped, and a rerun after a failed publish tries again.
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 env:
