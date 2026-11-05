@@ -796,7 +796,9 @@ async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
             file.token = None;
             file.broker = None;
         } else {
-            let legacy_broker = file.broker.clone().unwrap_or_else(|| broker.to_owned());
+            let Some(legacy_broker) = file.broker.clone() else {
+                bail!("legacy credentials have no recorded broker; migrate them explicitly before login");
+            };
             match issue_credentials(&legacy_broker, &legacy_token).await {
                 Ok(old) => {
                     if !file.registry.iter().any(|entry| entry.bucket == old.bucket) {
@@ -845,6 +847,14 @@ async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
+    let broker_url = url::Url::parse(broker).context("invalid broker URL")?;
+    if broker_url.scheme() != "wss"
+        || !broker_url.username().is_empty()
+        || broker_url.password().is_some()
+        || broker_url.query().is_some()
+    {
+        bail!("broker authentication requires wss without URL userinfo or query parameters");
+    }
     let mut request = broker
         .into_client_request()
         .with_context(|| format!("{broker} is not a valid WebSocket URL"))?;
