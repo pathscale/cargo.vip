@@ -774,7 +774,7 @@ async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
         bail!("cannot determine a config directory");
     };
 
-    eprintln!("Paste your {broker} token (it is not echoed to the terminal):");
+    eprintln!("Paste your {broker} token (input is echoed; use a private, unrecorded terminal):");
     let mut token = String::new();
     std::io::stdin()
         .read_line(&mut token)
