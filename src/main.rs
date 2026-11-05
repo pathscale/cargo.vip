@@ -26,7 +26,8 @@ use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::header::HOST;
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use rusty_s3::actions::GetObject;
@@ -929,6 +930,8 @@ struct Registry {
     /// against it rather than stored in the bucket, so nothing published records
     /// how a particular machine reaches the registry.
     origin: String,
+    authority: String,
+    access_prefix: String,
 }
 
 impl Registry {
@@ -1097,7 +1100,11 @@ async fn start_proxies(
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .context("binding the loopback listener")?;
-        let origin = format!("http://{}", listener.local_addr()?);
+        let authority = listener.local_addr()?.to_string();
+        let mut capability = [0u8; 32];
+        getrandom::fill(&mut capability).context("generating a loopback access capability")?;
+        let access_prefix = hex::encode(capability);
+        let origin = format!("http://{authority}/{access_prefix}");
         let registry = Arc::new(Registry {
             client: client.clone(),
             credentials: Credentials::new(resolved.key_id, resolved.key_secret),
@@ -1113,6 +1120,8 @@ async fn start_proxies(
             )
             .context("building the bucket")?,
             origin: origin.clone(),
+            authority,
+            access_prefix,
         });
         serving.push(tokio::spawn(serve(listener, Arc::clone(&registry))));
         proxies.push(ActiveProxy {
@@ -1388,12 +1397,38 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: Arc<Registry>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    let path = req.uri().path().to_owned();
+    if req.method() != Method::GET
+        || req.uri().scheme().is_some()
+        || req.uri().authority().is_some()
+        || req.uri().query().is_some()
+        || req.headers().get_all(HOST).iter().count() != 1
+        || req
+            .headers()
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            != Some(registry.authority.as_str())
+    {
+        return Ok(reply(
+            StatusCode::FORBIDDEN,
+            "text/plain",
+            "loopback request refused",
+        ));
+    }
+
+    let prefix = format!("/{}/", registry.access_prefix);
+    let Some(relative) = req.uri().path().strip_prefix(&prefix) else {
+        return Ok(reply(StatusCode::NOT_FOUND, "text/plain", "not found"));
+    };
+    let path = format!("/{relative}");
     Ok(match route(&path, &registry).await {
         Ok(response) => response,
-        Err(e) => {
-            tracing::error!("{path}: {e:#}");
-            reply(StatusCode::BAD_GATEWAY, "text/plain", format!("{e:#}"))
+        Err(_) => {
+            tracing::error!("registry upstream request failed");
+            reply(
+                StatusCode::BAD_GATEWAY,
+                "text/plain",
+                "registry upstream request failed",
+            )
         }
     })
 }
@@ -1420,8 +1455,12 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
                 "malformed download path",
             ));
         };
-        if hex::decode(cksum).map(|b| b.len()) != Ok(32) {
-            bail!("download path does not carry a sha256");
+        if !valid_download_components(name, version, cksum) {
+            return Ok(reply(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                "malformed download path",
+            ));
         }
 
         let key = Registry::crate_key(name, version, cksum);
@@ -1439,9 +1478,15 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
 
     // Anything else is an index path. Cargo already knows the sparse layout, so
     // it goes to the bucket as-is under a signed read.
-    let key = path.trim_start_matches('/');
-    if key.is_empty() {
-        return Ok(reply(StatusCode::NOT_FOUND, "text/plain", "no index path"));
+    let Some(key) = path.strip_prefix('/') else {
+        return Ok(reply(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            "invalid sparse index path",
+        ));
+    };
+    if !valid_sparse_index_key(key) {
+        return Ok(reply(StatusCode::NOT_FOUND, "text/plain", "invalid sparse index path"));
     }
 
     let url = GetObject::new(&registry.bucket, Some(&registry.credentials), key).sign(READ_TTL);
@@ -1477,6 +1522,43 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
         .expect("valid response"))
 }
 
+fn valid_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_download_components(name: &str, version: &str, checksum: &str) -> bool {
+    valid_crate_name(name)
+        && !version.is_empty()
+        && version != "."
+        && version != ".."
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        && checksum.len() == 64
+        && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_sparse_index_key(key: &str) -> bool {
+    let parts: Vec<_> = key.split('/').collect();
+    match parts.as_slice() {
+        ["1", name] => name.len() == 1 && valid_crate_name(name),
+        ["2", name] => name.len() == 2 && valid_crate_name(name),
+        ["3", first, name] => {
+            name.len() == 3 && valid_crate_name(name) && *first == &name[..1]
+        }
+        [first, second, name] => {
+            name.len() >= 4
+                && valid_crate_name(name)
+                && *first == &name[..2]
+                && *second == &name[2..4]
+        }
+        _ => false,
+    }
+}
+
 fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -1489,7 +1571,8 @@ fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Res
 mod tests {
     use super::{
         Args, FileConfig, Registry, Source, bucket_from_index, find_registry_index,
-        missing_token_message, save_registry_token, source,
+        missing_token_message, save_registry_token, source, valid_download_components,
+        valid_sparse_index_key,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1524,6 +1607,28 @@ mod tests {
             Registry::crate_key("worktable", "1.0.0-beta.11", "abc123"),
             "crates/worktable-1.0.0-beta.11_abc123.tar.gz",
         );
+    }
+
+    #[test]
+    fn accepts_sparse_layout_and_ascii_case_without_extra_path_components() {
+        for key in ["1/A", "2/Ab", "3/A/AbC", "Fo/UR/FoUr"] {
+            assert!(valid_sparse_index_key(key), "expected valid sparse key {key}");
+        }
+        for key in ["1/AA", "3/B/AbC", "Fo/UR/FoUr/extra", "../crate", "%2e%2e/crate"] {
+            assert!(!valid_sparse_index_key(key), "expected invalid sparse key {key}");
+        }
+    }
+
+    #[test]
+    fn accepts_only_single_component_crate_downloads_with_sha256_checksums() {
+        assert!(valid_download_components(
+            "Crate_Name",
+            "1.2.3-alpha.1+build.4",
+            &"a".repeat(64),
+        ));
+        assert!(!valid_download_components("../crate", "1.2.3", &"a".repeat(64)));
+        assert!(!valid_download_components("crate", "../1.2.3", &"a".repeat(64)));
+        assert!(!valid_download_components("crate", "1.2.3", "abc123"));
     }
 
     #[test]
