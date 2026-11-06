@@ -180,9 +180,12 @@ version is immutable, then the index entry read-modify-written under
 `If-Match`, retried if another publisher got there first. Publishing the same
 commit again is a no-op; changing a published version is refused.
 
-**A crate is published only if it says `publish = ["vip"]`.** The default
-`publish` lets a stray `cargo publish` send private source to crates.io, so
-`cargo vip publish` refuses it until the manifest closes that door.
+**A crate must explicitly allow the selected registry in `package.publish`.**
+For a private crate, use `publish = ["vip"]`; do not include `crates-io`.
+The default unrestricted `publish` could send private source to crates.io, so
+`cargo vip publish` refuses it. An explicit list can allow multiple registries
+for a package intended for those audiences; publishing to one does not publish
+to the others. The version comes from the Cargo manifest.
 
 A dependency on another crate in this registry is written as
 `{ version = "…", registry = "vip" }`. Its index entry omits `registry`, which
