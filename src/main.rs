@@ -331,7 +331,7 @@ fn source(args: &Args, file: &FileConfig, index: Option<&str>) -> Result<Source>
                 });
             }
 
-            stored_token_source(file, registry, target_bucket, &args.broker)
+            stored_token_source(file, registry, target_bucket)
         }
     }
 }
@@ -340,20 +340,13 @@ fn stored_token_source(
     file: &FileConfig,
     registry: &str,
     target_bucket: Option<String>,
-    default_broker: &str,
 ) -> Result<Source> {
-    let broker_for = |broker: &Option<String>| {
-        broker
-            .clone()
-            .or_else(|| file.broker.clone())
-            .unwrap_or_else(|| default_broker.to_owned())
-    };
-
     if let Some(bucket) = target_bucket {
         if let Some(entry) = file.find_by_bucket(&bucket) {
+            let (url, token) = saved_broker_pair(file, entry.broker.as_deref(), &entry.token)?;
             return Ok(Source::Broker {
-                url: broker_for(&entry.broker),
-                token: entry.token.clone(),
+                url,
+                token,
                 expected_bucket: Some(bucket),
                 legacy: false,
             });
@@ -362,8 +355,9 @@ fn stored_token_source(
         // Old credentials.toml files have no bucket field. Try the old token
         // once and accept it only when the broker confirms it belongs here.
         if let Some(token) = file.token.clone() {
+            let (url, token) = saved_broker_pair(file, None, &token)?;
             return Ok(Source::Broker {
-                url: broker_for(&file.broker),
+                url,
                 token,
                 expected_bucket: Some(bucket),
                 legacy: true,
@@ -374,17 +368,20 @@ fn stored_token_source(
 
     match (file.registry.as_slice(), file.token.as_ref()) {
         ([], Some(token)) => Ok(Source::Broker {
-            url: broker_for(&file.broker),
+            url: saved_broker_pair(file, None, token)?.0,
             token: token.clone(),
             expected_bucket: None,
             legacy: true,
         }),
-        ([entry], None) => Ok(Source::Broker {
-            url: broker_for(&entry.broker),
-            token: entry.token.clone(),
-            expected_bucket: Some(entry.bucket.clone()),
-            legacy: false,
-        }),
+        ([entry], None) => {
+            let (url, token) = saved_broker_pair(file, entry.broker.as_deref(), &entry.token)?;
+            Ok(Source::Broker {
+                url,
+                token,
+                expected_bucket: Some(entry.bucket.clone()),
+                legacy: false,
+            })
+        }
         ([], None) => bail!(
             "not logged in: run `cargo vip login` or set CARGO_VIP_TOKEN, or pass \
              --key-id/--key-secret with --bucket to use a key directly"
@@ -395,6 +392,21 @@ fn stored_token_source(
             index_env(registry)
         ),
     }
+}
+
+fn saved_broker_pair(
+    file: &FileConfig,
+    entry_broker: Option<&str>,
+    token: &str,
+) -> Result<(String, String)> {
+    let issuer = entry_broker
+        .filter(|broker| !broker.trim().is_empty())
+        .or_else(|| file.broker.as_deref().filter(|broker| !broker.trim().is_empty()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "saved broker token has no recorded issuer; record the verified issuer or explicitly re-enter the token against that issuer"
+        ))?;
+    validate_broker_url(issuer)?;
+    Ok((issuer.to_owned(), token.to_owned()))
 }
 
 fn is_crates_vip_index(index: &str) -> bool {
@@ -625,7 +637,6 @@ fn resolve_registry_with(
         .flatten()
         .or_else(|| args.bucket.clone());
     let cli_broker = &args.broker;
-    let file_broker = file.broker.as_deref().unwrap_or(&args.broker);
     if let Some(token) = per_registry_token.filter(|token| !token.is_empty()) {
         let resolved = exchange(cli_broker, token)?;
         if let Some(bucket) = expected_bucket.as_deref() {
@@ -650,10 +661,12 @@ fn resolve_registry_with(
             last_bucket = Some(resolved.bucket);
         }
         if let Some(entry) = file.find_by_bucket(bucket) {
-            return exchange(entry.broker.as_deref().unwrap_or(file_broker), &entry.token);
+            let (broker, token) = saved_broker_pair(file, entry.broker.as_deref(), &entry.token)?;
+            return exchange(&broker, &token);
         }
         if let Some(token) = &file.token {
-            let resolved = exchange(file_broker, token)?;
+            let (broker, token) = saved_broker_pair(file, None, token)?;
+            let resolved = exchange(&broker, &token)?;
             if resolved.bucket != bucket {
                 bail!("{}", missing_token_message(bucket));
             }
@@ -917,14 +930,7 @@ async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-    let broker_url = url::Url::parse(broker).context("invalid broker URL")?;
-    if broker_url.scheme() != "wss"
-        || !broker_url.username().is_empty()
-        || broker_url.password().is_some()
-        || broker_url.query().is_some()
-    {
-        bail!("broker authentication requires wss without URL userinfo or query parameters");
-    }
+    validate_broker_url(broker)?;
     let mut request = broker
         .into_client_request()
         .with_context(|| format!("{broker} is not a valid WebSocket URL"))?;
@@ -971,6 +977,18 @@ async fn issue_credentials(broker: &str, token: &str) -> Result<Resolved> {
         endpoint: field("endpoint")?,
         region: field("region")?,
     })
+}
+
+fn validate_broker_url(broker: &str) -> Result<()> {
+    let broker_url = url::Url::parse(broker).context("invalid broker URL")?;
+    if broker_url.scheme() != "wss"
+        || !broker_url.username().is_empty()
+        || broker_url.password().is_some()
+        || broker_url.query().is_some()
+    {
+        bail!("broker authentication requires wss without URL userinfo or query parameters");
+    }
+    Ok(())
 }
 
 async fn next_json<S>(socket: &mut S) -> Result<serde_json::Value>
@@ -1039,7 +1057,6 @@ fn wanted_broker_tokens(
     active_count: usize,
 ) -> Result<Vec<(String, String)>> {
     let cli_broker = &args.broker;
-    let file_broker = file.broker.as_deref().unwrap_or(&args.broker);
     let expected_bucket = index
         .map(|value| bucket_from_index(value, name))
         .transpose()?
@@ -1055,12 +1072,17 @@ fn wanted_broker_tokens(
                 .map(|token| (cli_broker.to_owned(), token.clone())),
         );
         if let Some(entry) = file.find_by_bucket(bucket) {
-            wanted.push((
-                entry.broker.as_deref().unwrap_or(file_broker).to_owned(),
-                entry.token.clone(),
-            ));
+            match saved_broker_pair(file, entry.broker.as_deref(), &entry.token) {
+                Ok(pair) => wanted.push(pair),
+                Err(error) if candidates.is_empty() => return Err(error),
+                Err(_) => {}
+            }
         } else if let Some(token) = &file.token {
-            wanted.push((file_broker.to_owned(), token.clone()));
+            match saved_broker_pair(file, None, token) {
+                Ok(pair) => wanted.push(pair),
+                Err(error) if candidates.is_empty() => return Err(error),
+                Err(_) => {}
+            }
         }
     } else if active_count == 1 && !candidates.is_empty() {
         wanted.push((cli_broker.to_owned(), candidates[0].clone()));
@@ -1102,11 +1124,16 @@ async fn resolve_active_registries(
     let mut result = Vec::new();
     for (name, index) in active {
         let specific = std::env::var(token_env(&name)).ok();
-        let can_skip = is_publish
-            && !args.registry.is_empty()
-            && publish_target.as_deref() != Some(name.as_str());
-        if !static_key {
-            let wanted = wanted_broker_tokens(
+        let can_skip = can_skip_registry(
+            is_publish,
+            !args.registry.is_empty(),
+            publish_target.as_deref(),
+            &name,
+        );
+        let wanted = if static_key {
+            Ok(Vec::new())
+        } else {
+            wanted_broker_tokens(
                 args,
                 file,
                 &name,
@@ -1114,31 +1141,48 @@ async fn resolve_active_registries(
                 specific.as_deref(),
                 &candidates,
                 active_count,
-            )?;
-            let mut skip_registry = false;
+            )
+        };
+        let mut exchanges = Vec::new();
+        if let Ok(wanted) = &wanted {
+            let expected_bucket = index
+                .as_deref()
+                .map(|value| bucket_from_index(value, &name))
+                .transpose()?
+                .flatten()
+                .or_else(|| args.bucket.clone());
             for (url, token) in wanted {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    cache.entry((url.clone(), token.clone()))
+                let key = (url.clone(), token.clone());
+                if !cache.contains_key(&key)
+                    && !exchanges.iter().any(|(exchanged, _)| exchanged == &key)
                 {
-                    match issue_credentials(&url, &token).await {
-                        Ok(credentials) => {
-                            entry.insert(credentials);
-                        }
-                        Err(error) if can_skip => {
-                            tracing::warn!(registry = %name, error = %error,
-                                "skipping registry whose credentials could not be resolved for publish");
-                            skip_registry = true;
-                            break;
-                        }
-                        Err(error) => return Err(error),
+                    let credentials = issue_credentials(url, token).await;
+                    let failed = credentials.is_err();
+                    exchanges.push((key.clone(), credentials));
+                    if failed {
+                        break;
                     }
                 }
-            }
-            if skip_registry {
-                continue;
+                let cache_match = cache.get(&key).is_some_and(|credentials| {
+                    expected_bucket
+                        .as_deref()
+                        .is_some_and(|bucket| credentials.bucket == bucket)
+                });
+                let exchange_match = exchanges
+                    .iter()
+                    .find(|(exchanged, _)| exchanged == &key)
+                    .and_then(|(_, credentials)| credentials.as_ref().ok())
+                    .is_some_and(|credentials| {
+                        expected_bucket
+                            .as_deref()
+                            .is_some_and(|bucket| credentials.bucket == bucket)
+                    });
+                if cache_match || exchange_match {
+                    break;
+                }
             }
         }
-        let resolved = resolve_registry_with(
+        if let Some(credentials) = finish_registry_resolution(
             args,
             file,
             &name,
@@ -1146,23 +1190,109 @@ async fn resolve_active_registries(
             &candidates,
             specific.as_deref(),
             active_count,
-            |broker, token| {
-                cache
-                    .get(&(broker.to_owned(), token.to_owned()))
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("credential exchange was not prepared"))
-            },
-        );
-        match resolved {
-            Ok(credentials) => result.push((name, credentials)),
-            Err(error) if can_skip => {
-                tracing::warn!(registry = %name, error = %error,
-                    "skipping registry whose credentials could not be resolved for publish");
-            }
-            Err(error) => return Err(error),
+            can_skip,
+            wanted,
+            exchanges,
+            &mut cache,
+        )? {
+            result.push((name, credentials));
         }
     }
     Ok((result, publish_target))
+}
+
+fn can_skip_registry(
+    is_publish: bool,
+    target_selected: bool,
+    publish_target: Option<&str>,
+    registry: &str,
+) -> bool {
+    is_publish && target_selected && publish_target != Some(registry)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_registry_resolution(
+    args: &Args,
+    file: &FileConfig,
+    name: &str,
+    index: Option<&str>,
+    candidates: &[String],
+    specific: Option<&str>,
+    active_count: usize,
+    can_skip: bool,
+    wanted: Result<Vec<(String, String)>>,
+    mut exchanges: Vec<((String, String), Result<Resolved>)>,
+    cache: &mut BTreeMap<(String, String), Resolved>,
+) -> Result<Option<Resolved>> {
+    let wanted = match wanted {
+        Ok(wanted) => wanted,
+        Err(error) if can_skip => {
+            tracing::warn!(registry = %name, error = %error,
+                "skipping registry whose credentials could not be resolved for publish");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let expected_bucket = index
+        .map(|value| bucket_from_index(value, name))
+        .transpose()?
+        .flatten()
+        .or_else(|| args.bucket.clone());
+    for pair in wanted {
+        if !cache.contains_key(&pair) {
+            let Some(position) = exchanges.iter().position(|(key, _)| key == &pair) else {
+                let error = anyhow::anyhow!("credential exchange was not prepared");
+                if can_skip {
+                    tracing::warn!(registry = %name, error = %error,
+                        "skipping registry whose credentials could not be resolved for publish");
+                    return Ok(None);
+                }
+                return Err(error);
+            };
+            match exchanges.remove(position).1 {
+                Ok(credentials) => {
+                    cache.insert(pair.clone(), credentials);
+                }
+                Err(error) if can_skip => {
+                    tracing::warn!(registry = %name, error = %error,
+                        "skipping registry whose credentials could not be resolved for publish");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if expected_bucket.as_deref().is_some_and(|bucket| {
+            cache
+                .get(&pair)
+                .is_some_and(|credentials| credentials.bucket == bucket)
+        }) {
+            break;
+        }
+    }
+    let resolved = resolve_registry_with(
+        args,
+        file,
+        name,
+        index,
+        candidates,
+        specific,
+        active_count,
+        |broker, token| {
+            cache
+                .get(&(broker.to_owned(), token.to_owned()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("credential exchange was not prepared"))
+        },
+    );
+    match resolved {
+        Ok(credentials) => Ok(Some(credentials)),
+        Err(error) if can_skip => {
+            tracing::warn!(registry = %name, error = %error,
+                "skipping registry whose credentials could not be resolved for publish");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn start_proxies(
@@ -1652,10 +1782,13 @@ fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, FileConfig, Registry, Source, bucket_from_index, find_registry_index,
-        missing_token_message, persist_credentials, save_registry_token, source,
-        valid_download_components, valid_sparse_index_key,
+        Args, FileConfig, Registry, RegistryToken, Resolved, Source, bucket_from_index,
+        can_skip_registry, find_registry_index, finish_registry_resolution, missing_token_message,
+        persist_credentials, resolve_registry_with, save_registry_token, saved_broker_pair,
+        select_active_registries, source, valid_download_components, valid_sparse_index_key,
+        wanted_broker_tokens,
     };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1741,7 +1874,7 @@ mod tests {
 
     #[test]
     fn accepts_sparse_layout_and_ascii_case_without_extra_path_components() {
-        for key in ["1/A", "2/Ab", "3/A/AbC", "Fo/UR/FoUr"] {
+        for key in ["1/A", "2/Ab", "3/A/AbC", "Fo/Ur/FoUr"] {
             assert!(
                 valid_sparse_index_key(key),
                 "expected valid sparse key {key}"
@@ -1750,7 +1883,7 @@ mod tests {
         for key in [
             "1/AA",
             "3/B/AbC",
-            "Fo/UR/FoUr/extra",
+            "Fo/Ur/FoUr/extra",
             "../crate",
             "%2e%2e/crate",
         ] {
@@ -1787,6 +1920,630 @@ mod tests {
             toml::from_str("broker = \"wss://old.example\"\ntoken = \"old-token\"\n").unwrap();
         assert_eq!(file.token.as_deref(), Some("old-token"));
         assert!(file.registry.is_empty());
+    }
+
+    fn saved_broker_resolved(args: &Args, token: &str, bucket: &str) -> Resolved {
+        Resolved {
+            key_id: format!("id-{token}"),
+            key_secret: format!("secret-{token}"),
+            bucket: bucket.to_owned(),
+            endpoint: args.endpoint.clone(),
+            region: args.region.clone(),
+        }
+    }
+
+    #[test]
+    fn saved_broker_uses_entry_issuer_then_top_level_fallback() {
+        let file = FileConfig {
+            broker: Some("wss://top.example/preserved".into()),
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-secret".into(),
+                broker: Some("wss://entry.example/exact".into()),
+            }],
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            saved_broker_pair(&file, file.registry[0].broker.as_deref(), "saved-secret").unwrap(),
+            ("wss://entry.example/exact".into(), "saved-secret".into())
+        );
+        assert_eq!(
+            saved_broker_pair(&file, Some("  "), "saved-secret").unwrap(),
+            ("wss://top.example/preserved".into(), "saved-secret".into())
+        );
+
+        let malformed = saved_broker_pair(&file, Some("https://bad.example"), "saved-secret")
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("wss"));
+        assert!(!malformed.contains("top.example"));
+    }
+
+    #[test]
+    fn saved_broker_requires_a_recorded_issuer_without_disclosing_values() {
+        let file = FileConfig {
+            token: Some("legacy-secret".into()),
+            ..FileConfig::default()
+        };
+        let error = super::stored_token_source(&file, "vip", None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("record the verified issuer"));
+        assert!(!error.contains("legacy-secret"));
+        assert!(!error.contains("api.crates.vip"));
+        assert!(
+            source(
+                &args(),
+                &FileConfig {
+                    registry: vec![RegistryToken {
+                        bucket: "alpha".into(),
+                        token: "entry-secret".into(),
+                        broker: None,
+                    }],
+                    ..FileConfig::default()
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn saved_broker_legacy_token_uses_only_its_recorded_issuer() {
+        let file = FileConfig {
+            broker: Some("wss://legacy.example/original".into()),
+            token: Some("legacy-token".into()),
+            ..FileConfig::default()
+        };
+        for index in [None, Some("sparse+https://crates.vip/alpha/")] {
+            match source(&args(), &file, index).unwrap() {
+                Source::Broker { url, token, .. } => {
+                    assert_eq!(url, "wss://legacy.example/original");
+                    assert_eq!(token, "legacy-token");
+                }
+                Source::Static(_) => panic!("expected saved broker credentials"),
+            }
+        }
+    }
+
+    #[test]
+    fn saved_broker_candidate_match_wins_before_a_blocked_saved_record() {
+        let args = args();
+        let file = FileConfig {
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-secret".into(),
+                broker: Some("https://invalid.example".into()),
+            }],
+            ..FileConfig::default()
+        };
+        let candidates = vec!["candidate-token".to_owned()];
+        let wanted = wanted_broker_tokens(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            None,
+            &candidates,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            wanted,
+            vec![(args.broker.clone(), "candidate-token".into())]
+        );
+
+        let mut exchanges = Vec::new();
+        let resolved = resolve_registry_with(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &candidates,
+            None,
+            1,
+            |broker, token| {
+                exchanges.push((broker.to_owned(), token.to_owned()));
+                Ok(saved_broker_resolved(&args, token, "alpha"))
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.bucket, "alpha");
+        assert_eq!(exchanges, vec![(args.broker, "candidate-token".into())]);
+    }
+
+    #[test]
+    fn saved_broker_unmatched_candidate_returns_issuer_error_without_exchange() {
+        let args = args();
+        let file = FileConfig {
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-secret".into(),
+                broker: Some("https://invalid.example".into()),
+            }],
+            ..FileConfig::default()
+        };
+        let mut exchanges = Vec::new();
+        let error = resolve_registry_with(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &["candidate-token".into()],
+            None,
+            1,
+            |broker, token| {
+                exchanges.push((broker.to_owned(), token.to_owned()));
+                Ok(saved_broker_resolved(&args, token, "other"))
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(exchanges.len(), 1);
+        assert!(error.contains("wss"));
+        assert!(!error.contains("saved-secret"));
+
+        let mut blocked_calls = 0;
+        let blocked = resolve_registry_with(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            None,
+            1,
+            |_, _| {
+                blocked_calls += 1;
+                Ok(saved_broker_resolved(&args, "saved-secret", "alpha"))
+            },
+        );
+        assert!(blocked.is_err());
+        assert_eq!(blocked_calls, 0);
+    }
+
+    #[test]
+    fn saved_broker_planner_and_resolver_share_the_exact_prepared_pair() {
+        let args = args();
+        let file = FileConfig {
+            broker: Some("wss://issuer.example/original/path".into()),
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-token".into(),
+                broker: Some("  ".into()),
+            }],
+            ..FileConfig::default()
+        };
+        let wanted = wanted_broker_tokens(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            None,
+            &[],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            wanted,
+            vec![(
+                "wss://issuer.example/original/path".into(),
+                "saved-token".into()
+            )]
+        );
+        let mut exchanged = Vec::new();
+        resolve_registry_with(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            None,
+            1,
+            |broker, token| {
+                exchanged.push((broker.to_owned(), token.to_owned()));
+                Ok(saved_broker_resolved(&args, token, "alpha"))
+            },
+        )
+        .unwrap();
+        assert_eq!(wanted, exchanged);
+    }
+
+    #[test]
+    fn saved_broker_planner_and_resolver_cover_record_types_and_index_paths() {
+        let args = args();
+        let known_index = "sparse+https://crates.vip/alpha/";
+        let placeholder_index = "sparse+https://crates.vip/index/";
+        let per_bucket = FileConfig {
+            broker: Some("wss://top.example/unchanged".into()),
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "bucket-token".into(),
+                broker: Some("wss://entry.example/preserved".into()),
+            }],
+            ..FileConfig::default()
+        };
+        for index in [known_index, placeholder_index] {
+            let wanted =
+                wanted_broker_tokens(&args, &per_bucket, "vip", Some(index), None, &[], 2).unwrap();
+            assert_eq!(
+                wanted,
+                vec![(
+                    "wss://entry.example/preserved".into(),
+                    "bucket-token".into()
+                )]
+            );
+            let prepared: Vec<_> = wanted
+                .iter()
+                .map(|pair| {
+                    (
+                        pair.clone(),
+                        Ok(saved_broker_resolved(&args, &pair.1, "alpha")),
+                    )
+                })
+                .collect();
+            let planned = wanted.clone();
+            let mut cache = BTreeMap::new();
+            let resolved = finish_registry_resolution(
+                &args,
+                &per_bucket,
+                "vip",
+                Some(index),
+                &[],
+                None,
+                2,
+                false,
+                Ok(wanted),
+                prepared,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolved.bucket, "alpha");
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.get(&planned[0]).unwrap().bucket, "alpha");
+        }
+
+        let legacy = FileConfig {
+            broker: Some("wss://legacy.example/original/path".into()),
+            token: Some("legacy-token".into()),
+            ..FileConfig::default()
+        };
+        for (index, expected_bucket) in [(known_index, Some("alpha")), (placeholder_index, None)] {
+            let wanted =
+                wanted_broker_tokens(&args, &legacy, "vip", Some(index), None, &[], 2).unwrap();
+            assert_eq!(
+                wanted,
+                vec![(
+                    "wss://legacy.example/original/path".into(),
+                    "legacy-token".into()
+                )]
+            );
+            let prepared: Vec<_> = wanted
+                .iter()
+                .map(|pair| {
+                    (
+                        pair.clone(),
+                        Ok(saved_broker_resolved(
+                            &args,
+                            &pair.1,
+                            expected_bucket.unwrap_or("discovered-bucket"),
+                        )),
+                    )
+                })
+                .collect();
+            let planned = wanted.clone();
+            let mut cache = BTreeMap::new();
+            let resolved = finish_registry_resolution(
+                &args,
+                &legacy,
+                "vip",
+                Some(index),
+                &[],
+                None,
+                2,
+                false,
+                Ok(wanted),
+                prepared,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                resolved.bucket,
+                expected_bucket.unwrap_or("discovered-bucket")
+            );
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.get(&planned[0]).unwrap().bucket, resolved.bucket);
+        }
+
+        let mut mismatch_calls = 0;
+        let mismatch = resolve_registry_with(
+            &args,
+            &legacy,
+            "vip",
+            Some(known_index),
+            &[],
+            None,
+            2,
+            |_, token| {
+                mismatch_calls += 1;
+                Ok(saved_broker_resolved(&args, token, "other"))
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(mismatch_calls, 1);
+        assert!(mismatch.contains(&missing_token_message("alpha")));
+    }
+
+    #[test]
+    fn saved_broker_issuerless_saved_records_stop_planning_before_any_exchange() {
+        let args = args();
+        let known_index = "sparse+https://crates.vip/alpha/";
+        let placeholder_index = "sparse+https://crates.vip/index/";
+        let files = [
+            FileConfig {
+                registry: vec![RegistryToken {
+                    bucket: "alpha".into(),
+                    token: "bucket-token".into(),
+                    broker: None,
+                }],
+                ..FileConfig::default()
+            },
+            FileConfig {
+                token: Some("legacy-token".into()),
+                ..FileConfig::default()
+            },
+            FileConfig {
+                registry: vec![RegistryToken {
+                    bucket: "alpha".into(),
+                    token: "bucket-token".into(),
+                    broker: Some("  ".into()),
+                }],
+                ..FileConfig::default()
+            },
+            FileConfig {
+                token: Some("legacy-token".into()),
+                broker: Some("  ".into()),
+                ..FileConfig::default()
+            },
+        ];
+        for file in &files {
+            for index in [known_index, placeholder_index] {
+                let wanted = wanted_broker_tokens(&args, file, "vip", Some(index), None, &[], 2);
+                assert!(
+                    wanted
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("record the verified issuer")
+                );
+
+                let mut resolver_calls = 0;
+                let error =
+                    resolve_registry_with(&args, file, "vip", Some(index), &[], None, 2, |_, _| {
+                        resolver_calls += 1;
+                        Ok(saved_broker_resolved(&args, "unused", "alpha"))
+                    })
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains("record the verified issuer"));
+                assert_eq!(resolver_calls, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn saved_broker_explicit_override_and_static_key_keep_precedence() {
+        let args = args();
+        let file = FileConfig {
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-token".into(),
+                broker: Some("https://invalid.example".into()),
+            }],
+            ..FileConfig::default()
+        };
+        let mut explicit_calls = 0;
+        resolve_registry_with(
+            &args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            Some("per-registry-token"),
+            1,
+            |broker, token| {
+                explicit_calls += 1;
+                assert_eq!(broker, args.broker.as_str());
+                assert_eq!(token, "per-registry-token");
+                Ok(saved_broker_resolved(&args, token, "alpha"))
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit_calls, 1);
+
+        let mut static_args = args;
+        static_args.bucket = Some("alpha".into());
+        static_args.key_id = Some("static-id".into());
+        static_args.key_secret = Some("static-secret".into());
+        let mut static_calls = 0;
+        let static_result = resolve_registry_with(
+            &static_args,
+            &file,
+            "alpha",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            None,
+            1,
+            |_, _| {
+                static_calls += 1;
+                unreachable!("static keys bypass exchange")
+            },
+        )
+        .unwrap();
+        assert_eq!(static_result.key_id, "static-id");
+        assert_eq!(static_calls, 0);
+    }
+
+    #[test]
+    fn saved_broker_optional_publish_preparation_error_preserves_target_and_skips_off_target() {
+        let mut publish_args = args();
+        publish_args.registry = vec!["target".into()];
+        let index_placeholder = "sparse+https://crates.vip/index/";
+        let discovered = vec![
+            (
+                "target".to_owned(),
+                "sparse+https://crates.vip/alpha/".to_owned(),
+            ),
+            ("optional".to_owned(), index_placeholder.to_owned()),
+        ];
+        let (active, publish_target) =
+            select_active_registries(&["target".to_owned()], &discovered, true).unwrap();
+        assert!(active.iter().any(|(name, index)| {
+            name == "optional" && index.as_deref() == Some(index_placeholder)
+        }));
+        assert_eq!(publish_target.as_deref(), Some("target"));
+
+        let issuerless_file = FileConfig {
+            registry: vec![RegistryToken {
+                bucket: "alpha".into(),
+                token: "saved-token".into(),
+                broker: None,
+            }],
+            ..FileConfig::default()
+        };
+        let wanted_success = wanted_broker_tokens(
+            &publish_args,
+            &issuerless_file,
+            "target",
+            Some("sparse+https://crates.vip/alpha/"),
+            Some("target-token"),
+            &[],
+            active.len(),
+        )
+        .unwrap();
+        assert_eq!(wanted_success.len(), 1);
+        let target_pair = wanted_success[0].clone();
+        let target = finish_registry_resolution(
+            &publish_args,
+            &issuerless_file,
+            "target",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            Some("target-token"),
+            active.len(),
+            can_skip_registry(true, true, publish_target.as_deref(), "target"),
+            Ok(wanted_success),
+            vec![(
+                target_pair,
+                Ok(saved_broker_resolved(
+                    &publish_args,
+                    "target-token",
+                    "alpha",
+                )),
+            )],
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert!(target.is_some());
+
+        let wanted_optional = wanted_broker_tokens(
+            &publish_args,
+            &issuerless_file,
+            "optional",
+            Some(index_placeholder),
+            None,
+            &[],
+            2,
+        );
+        assert!(
+            wanted_optional
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("record the verified issuer")
+        );
+
+        let optional = finish_registry_resolution(
+            &publish_args,
+            &issuerless_file,
+            "optional",
+            Some(index_placeholder),
+            &[],
+            None,
+            active.len(),
+            can_skip_registry(true, true, publish_target.as_deref(), "optional"),
+            wanted_optional,
+            Vec::new(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert!(optional.is_none());
+
+        let wanted_target = wanted_broker_tokens(
+            &publish_args,
+            &issuerless_file,
+            "target",
+            Some("sparse+https://crates.vip/alpha/"),
+            None,
+            &[],
+            active.len(),
+        );
+        let target_error = finish_registry_resolution(
+            &publish_args,
+            &issuerless_file,
+            "target",
+            Some("sparse+https://crates.vip/alpha/"),
+            &[],
+            None,
+            active.len(),
+            can_skip_registry(true, true, publish_target.as_deref(), "target"),
+            wanted_target,
+            Vec::new(),
+            &mut Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            target_error
+                .to_string()
+                .contains("record the verified issuer")
+        );
+
+        for (command, is_publish) in [("build", false), ("serve", false)] {
+            let mut ordinary_args = args();
+            ordinary_args.cargo_args = vec![command.to_owned()];
+            let wanted = wanted_broker_tokens(
+                &ordinary_args,
+                &issuerless_file,
+                "optional",
+                Some(index_placeholder),
+                None,
+                &[],
+                active.len(),
+            );
+            let error = finish_registry_resolution(
+                &ordinary_args,
+                &issuerless_file,
+                "optional",
+                Some(index_placeholder),
+                &[],
+                None,
+                active.len(),
+                can_skip_registry(is_publish, false, publish_target.as_deref(), "optional"),
+                wanted,
+                Vec::new(),
+                &mut Default::default(),
+            )
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("record the verified issuer"));
+        }
     }
 
     #[test]
