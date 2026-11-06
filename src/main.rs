@@ -25,8 +25,8 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
-use hyper::service::service_fn;
 use hyper::header::HOST;
+use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
@@ -193,6 +193,85 @@ fn credentials_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .map(|d| d.join("cargo-vip").join("credentials.toml"))
+}
+
+/// Persist credentials without ever opening the final path for truncating write.
+/// On Unix the same-directory rename atomically replaces the old regular file;
+/// other platforms receive their native rename semantics, which are not
+/// promised to be atomic replacement.
+fn persist_credentials(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    let parent = path.parent().context("credential path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let parent_meta =
+        fs::symlink_metadata(parent).with_context(|| format!("checking {}", parent.display()))?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        bail!(
+            "credential directory is not a real directory: {}",
+            parent.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", parent.display()))?;
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("refusing unsafe credential destination: {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+    }
+
+    let mut temporary = None;
+    let mut file = None;
+    for _ in 0..8 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).context("generating a credential temporary name")?;
+        let candidate = parent.join(format!(".credentials-{}.tmp", hex::encode(random)));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(created) => {
+                temporary = Some(candidate);
+                file = Some(created);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("creating temporary credentials in {}", parent.display())
+                });
+            }
+        }
+    }
+    let temporary = temporary.context("could not allocate a unique credential temporary file")?;
+    let write_result = (|| -> Result<()> {
+        let mut file = file.context("credential temporary file was not opened")?;
+        file.write_all(contents)
+            .context("writing temporary credentials")?;
+        file.sync_all().context("syncing temporary credentials")?;
+        drop(file);
+        // On Unix, rename replaces the destination directory entry atomically.
+        // Other platforms may reject replacement; then the old file remains.
+        fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 fn load_file_config() -> Result<FileConfig> {
@@ -797,7 +876,9 @@ async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
             file.broker = None;
         } else {
             let Some(legacy_broker) = file.broker.clone() else {
-                bail!("legacy credentials have no recorded broker; migrate them explicitly before login");
+                bail!(
+                    "legacy credentials have no recorded broker; migrate them explicitly before login"
+                );
             };
             match issue_credentials(&legacy_broker, &legacy_token).await {
                 Ok(old) => {
@@ -815,19 +896,8 @@ async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
     }
     save_registry_token(&mut file, &resolved.bucket, token, broker);
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
     let text = toml::to_string_pretty(&file).context("serializing credentials")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-
-    // The file holds a credential; other users on the machine should not read it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting {}", path.display()))?;
-    }
+    persist_credentials(&path, text.as_bytes())?;
 
     eprintln!("logged in; registry bucket {}", resolved.bucket);
     Ok(())
@@ -1496,7 +1566,11 @@ async fn route(path: &str, registry: &Registry) -> Result<Response<Full<Bytes>>>
         ));
     };
     if !valid_sparse_index_key(key) {
-        return Ok(reply(StatusCode::NOT_FOUND, "text/plain", "invalid sparse index path"));
+        return Ok(reply(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            "invalid sparse index path",
+        ));
     }
 
     let url = GetObject::new(&registry.bucket, Some(&registry.credentials), key).sign(READ_TTL);
@@ -1556,9 +1630,7 @@ fn valid_sparse_index_key(key: &str) -> bool {
     match parts.as_slice() {
         ["1", name] => name.len() == 1 && valid_crate_name(name),
         ["2", name] => name.len() == 2 && valid_crate_name(name),
-        ["3", first, name] => {
-            name.len() == 3 && valid_crate_name(name) && *first == &name[..1]
-        }
+        ["3", first, name] => name.len() == 3 && valid_crate_name(name) && *first == &name[..1],
         [first, second, name] => {
             name.len() >= 4
                 && valid_crate_name(name)
@@ -1581,8 +1653,8 @@ fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Res
 mod tests {
     use super::{
         Args, FileConfig, Registry, Source, bucket_from_index, find_registry_index,
-        missing_token_message, save_registry_token, source, valid_download_components,
-        valid_sparse_index_key,
+        missing_token_message, persist_credentials, save_registry_token, source,
+        valid_download_components, valid_sparse_index_key,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1611,6 +1683,54 @@ mod tests {
         std::env::temp_dir().join(format!("cargo-vip-test-{}-{nonce}", std::process::id()))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_persistence_uses_private_modes_and_replaces_contents() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = test_directory();
+        fs::create_dir(&root).unwrap();
+        let parent = root.join("cargo-vip");
+        let path = parent.join("credentials.toml");
+        persist_credentials(&path, b"old-token").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        persist_credentials(&path, b"new-token").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new-token");
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let foreign = root.join("foreign");
+        fs::write(&foreign, b"preserve").unwrap();
+        let linked = root.join("linked-credentials");
+        symlink(&foreign, &linked).unwrap();
+        assert!(persist_credentials(&linked, b"replacement").is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_persistence_refuses_a_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory();
+        fs::create_dir(&root).unwrap();
+        let real_parent = root.join("real");
+        fs::create_dir(&real_parent).unwrap();
+        let linked_parent = root.join("cargo-vip");
+        symlink(&real_parent, &linked_parent).unwrap();
+        assert!(persist_credentials(&linked_parent.join("credentials.toml"), b"secret").is_err());
+        assert!(!real_parent.join("credentials.toml").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn crate_key_is_content_addressed() {
         assert_eq!(
@@ -1622,10 +1742,22 @@ mod tests {
     #[test]
     fn accepts_sparse_layout_and_ascii_case_without_extra_path_components() {
         for key in ["1/A", "2/Ab", "3/A/AbC", "Fo/UR/FoUr"] {
-            assert!(valid_sparse_index_key(key), "expected valid sparse key {key}");
+            assert!(
+                valid_sparse_index_key(key),
+                "expected valid sparse key {key}"
+            );
         }
-        for key in ["1/AA", "3/B/AbC", "Fo/UR/FoUr/extra", "../crate", "%2e%2e/crate"] {
-            assert!(!valid_sparse_index_key(key), "expected invalid sparse key {key}");
+        for key in [
+            "1/AA",
+            "3/B/AbC",
+            "Fo/UR/FoUr/extra",
+            "../crate",
+            "%2e%2e/crate",
+        ] {
+            assert!(
+                !valid_sparse_index_key(key),
+                "expected invalid sparse key {key}"
+            );
         }
     }
 
@@ -1636,8 +1768,16 @@ mod tests {
             "1.2.3-alpha.1+build.4",
             &"a".repeat(64),
         ));
-        assert!(!valid_download_components("../crate", "1.2.3", &"a".repeat(64)));
-        assert!(!valid_download_components("crate", "../1.2.3", &"a".repeat(64)));
+        assert!(!valid_download_components(
+            "../crate",
+            "1.2.3",
+            &"a".repeat(64)
+        ));
+        assert!(!valid_download_components(
+            "crate",
+            "../1.2.3",
+            &"a".repeat(64)
+        ));
         assert!(!valid_download_components("crate", "1.2.3", "abc123"));
     }
 
