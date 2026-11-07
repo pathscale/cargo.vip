@@ -124,15 +124,22 @@ bucket and asks you to run `cargo vip login` with a token for it.
 
 ### Using a key directly
 
-CI, and any bucket with no broker in front of it, pass the key explicitly. This
-skips the broker entirely and never touches the network for credentials:
+CI, and any bucket with no broker in front of it, can pass the key directly.
+This skips the broker entirely. Prefer environment variables so the secret is
+not included in the process arguments:
 
 ```sh
-cargo vip --key-id "$KEY" --key-secret "$SECRET" --bucket my-crates build
+CARGO_VIP_KEY_ID="$KEY" CARGO_VIP_KEY_SECRET="$SECRET" \
+  cargo vip --bucket my-crates build
 ```
 
-or as `CARGO_VIP_KEY_ID`, `CARGO_VIP_KEY_SECRET`, `CARGO_VIP_BUCKET`, or in
-`~/.config/cargo-vip/credentials.toml`:
+Environment input keeps the secret out of argv, though it can still reach child
+process environments. The `--key-id` and `--key-secret` flags remain supported,
+but their values appear in process arguments, and literal secret values may
+remain in shell history.
+
+You can also set `CARGO_VIP_KEY_ID`, `CARGO_VIP_KEY_SECRET`, and
+`CARGO_VIP_BUCKET`, or put the values in `~/.config/cargo-vip/credentials.toml`:
 
 ```toml
 key_id = "tid_…"
