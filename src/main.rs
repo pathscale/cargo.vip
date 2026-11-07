@@ -889,15 +889,21 @@ fn save_registry_token(file: &mut FileConfig, bucket: &str, token: &str, broker:
 /// The token is what gets persisted; the object-store key never is. Revoking
 /// the token at the registry therefore ends access at the next build.
 async fn login(broker: &str, mut file: FileConfig) -> Result<()> {
+    use std::io::IsTerminal;
+
     let Some(path) = credentials_path() else {
         bail!("cannot determine a config directory");
     };
 
-    eprintln!("Paste your {broker} token (input is echoed; use a private, unrecorded terminal):");
-    let mut token = String::new();
-    std::io::stdin()
-        .read_line(&mut token)
-        .context("reading the token")?;
+    let stdin = std::io::stdin();
+    let token = if stdin.is_terminal() {
+        rpassword::prompt_password(format!("Enter your {broker} token: "))
+            .context("reading the token")?
+    } else {
+        let mut token = String::new();
+        stdin.read_line(&mut token).context("reading the token")?;
+        token
+    };
     let token = token.trim();
     if token.is_empty() {
         bail!("no token given");
@@ -2889,7 +2895,7 @@ mod tests {
         )];
         let found = discover_registries(&root, None, &env).unwrap();
         fs::remove_dir_all(root).unwrap();
-        assert!(found.is_empty());
+        assert_eq!(found, Vec::<(String, String)>::new());
     }
 
     #[test]
@@ -2941,8 +2947,8 @@ mod tests {
                 );
                 assert_eq!(publish.unwrap().1.as_deref(), Some("upstream"));
             } else {
-                assert!(config.is_empty());
-                assert!(overrides.is_empty());
+                assert_eq!(config, Vec::<String>::new());
+                assert_eq!(overrides, Vec::<(String, String)>::new());
                 assert!(publish.is_err());
             }
             let (explicit, _) =
