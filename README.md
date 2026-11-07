@@ -118,9 +118,14 @@ cargo vip --registry backend build
 ```
 
 The saved credentials file has one `[[registry]]` entry per bucket. A previous
-single-token file still works and is migrated the next time a login can resolve
-its bucket. If the selected bucket has no saved token, `cargo vip` reports the
-bucket and asks you to run `cargo vip login` with a token for it.
+single-token file can still be used when it records the token’s verified broker
+issuer. If no issuer is recorded, record the verified original issuer or explicitly
+re-enter the same token during `cargo vip login` against that issuer; changing the
+broker for a normal command does not bind an existing saved token to it. Login can
+migrate the legacy token after successful verification. If a different legacy token
+cannot be resolved, it is retained in legacy form. If the selected bucket has no
+saved token, `cargo vip` reports the bucket and asks you to run `cargo vip login`
+with a token for it.
 
 ### Using a key directly
 
