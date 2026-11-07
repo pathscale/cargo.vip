@@ -76,8 +76,11 @@ The driver is started directly, without a shell, with the original arguments (`b
 `--release`, and so on). `CARGO_VIP_CARGO_CONFIG_JSON` contains a JSON array of strings: the
 Cargo `--config` arguments that point each selected registry at its loopback proxy. The driver
 also receives the registry index environment variables and inherits the caller's environment,
-including `CARGO` when set. It is responsible for interpreting the JSON configuration. Its exit
-status becomes the `cargo vip` exit status.
+including `CARGO` when set. It is responsible for interpreting the JSON configuration. Use a
+trusted driver: it receives access to the active registry proxies and inherits the caller's
+environment, which may include exported credentials. The driver's numeric exit code becomes the
+`cargo vip` exit code. If no numeric code is available, such as when a signal terminates the
+driver on Unix, `cargo vip` exits with code 1.
 
 Selecting a build driver supports only `build` and `check`; `test`, `publish`, `login`, `env`,
 and other commands fail with an error instead of falling back to Cargo. Without a selected
