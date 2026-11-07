@@ -234,6 +234,19 @@ crates record the stable URL, so neither changes with the port.
 - TLS is rustls with compiled-in webpki roots. No OpenSSL, no system trust
   store, no C toolchain.
 
+## Publishing this crate
+
+Change the package version in `Cargo.toml`, complete local checks and review, then
+rebase-merge the change. Publishing is manual:
+
+```sh
+gh workflow run publish.yml --repo pathscale/cargo.vip --ref master
+```
+
+The workflow runs `cargo publish --registry crates-io` for the manifest version.
+It does not require or create a release tag. CI is also manual. Publishing an
+already published version fails; a new release requires a new manifest version.
+
 ## Licence
 
 MIT OR Apache-2.0.
