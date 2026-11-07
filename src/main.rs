@@ -1121,6 +1121,7 @@ fn wanted_broker_tokens(
 
 /// The keys this run uses: explicit, or issued by the broker for each active
 /// registry's configured bucket.
+#[allow(clippy::too_many_lines)]
 async fn resolve_active_registries(
     args: &Args,
     file: &FileConfig,
@@ -1395,6 +1396,7 @@ fn validate_build_driver_request(args: &Args) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1657,16 +1659,15 @@ async fn handle(
         return Ok(reply(StatusCode::NOT_FOUND, "text/plain", "not found"));
     };
     let path = format!("/{relative}");
-    Ok(match route(&path, &registry).await {
-        Ok(response) => response,
-        Err(_) => {
-            tracing::error!("registry upstream request failed");
-            reply(
-                StatusCode::BAD_GATEWAY,
-                "text/plain",
-                "registry upstream request failed",
-            )
-        }
+    Ok(if let Ok(response) = route(&path, &registry).await {
+        response
+    } else {
+        tracing::error!("registry upstream request failed");
+        reply(
+            StatusCode::BAD_GATEWAY,
+            "text/plain",
+            "registry upstream request failed",
+        )
     })
 }
 
@@ -2196,6 +2197,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn saved_broker_planner_and_resolver_cover_record_types_and_index_paths() {
         let args = args();
         let known_index = "sparse+https://crates.vip/alpha/";
@@ -2438,6 +2440,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn saved_broker_optional_publish_preparation_error_preserves_target_and_skips_off_target() {
         let mut publish_args = args();
         publish_args.registry = vec!["target".into()];
@@ -2494,7 +2497,7 @@ mod tests {
                     "alpha",
                 )),
             )],
-            &mut Default::default(),
+            &mut BTreeMap::default(),
         )
         .unwrap();
         assert!(target.is_some());
@@ -2527,7 +2530,7 @@ mod tests {
             can_skip_registry(true, true, publish_target.as_deref(), "optional"),
             wanted_optional,
             Vec::new(),
-            &mut Default::default(),
+            &mut BTreeMap::default(),
         )
         .unwrap();
         assert!(optional.is_none());
@@ -2552,7 +2555,7 @@ mod tests {
             can_skip_registry(true, true, publish_target.as_deref(), "target"),
             wanted_target,
             Vec::new(),
-            &mut Default::default(),
+            &mut BTreeMap::default(),
         )
         .err()
         .unwrap();
@@ -2585,7 +2588,7 @@ mod tests {
                 can_skip_registry(is_publish, false, publish_target.as_deref(), "optional"),
                 wanted,
                 Vec::new(),
-                &mut Default::default(),
+                &mut BTreeMap::default(),
             )
             .err()
             .unwrap();
@@ -2864,8 +2867,7 @@ mod tests {
             .unwrap();
         let error = runtime
             .block_on(super::next_json(&mut stream))
-            .err()
-            .expect("close frame must fail");
+            .expect_err("close frame must fail");
         let error = format!("{error:#}");
         assert!(error.contains("closed the connection"));
         assert!(!error.contains(reason));

@@ -1,158 +1,190 @@
 name: release
 
+concurrency:
+  group: cargo-vip-version-tag
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
+      reviewed_sha:
+        description: Full SHA of the reviewed master dispatch commit
+        type: string
+        required: true
+      evidence_run_id:
+        description: Publisher evidence run ID for this SHA
+        type: string
+        required: true
+      build_run_id:
+        description: Earlier binary build run ID for this SHA, or blank to build
+        type: string
       force:
-        description: Rebuild and replace assets for the current version
+        description: Replace conflicting assets on the already matching tag
         type: boolean
-        required: false
         default: false
 
 permissions:
   contents: read
 
+env:
+  RUST_VERSION: '1.94.1'
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release-info:
+  guard:
     runs-on: ubicloud-standard-2
-    outputs:
-      version: ${{ steps.release.outputs.version }}
-      tag: ${{ steps.release.outputs.tag }}
-      build: ${{ steps.release.outputs.build }}
+    timeout-minutes: 5
+    permissions: {}
     steps:
-      - uses: actions/checkout@v4
-      - id: release
+      - name: Bind review to the dispatch commit before checkout
         env:
-          GH_TOKEN: ${{ github.token }}
-          FORCE: ${{ github.event.inputs.force || 'false' }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          test -n "$version"
-          tag="v$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [[ $GITHUB_EVENT_NAME == workflow_dispatch && $GITHUB_REF == refs/heads/master &&
+             $REVIEWED_SHA =~ ^[0-9a-f]{40}$ && $REVIEWED_SHA == "$GITHUB_SHA" ]]
 
-          if [ "$FORCE" = "true" ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          status=$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")
-          if [ "$status" = 200 ]; then
-            echo "$tag already has a GitHub release"
-            echo "build=false" >> "$GITHUB_OUTPUT"
-          elif [ "$status" = 404 ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::GitHub release lookup returned HTTP $status" >&2
-            exit 1
-          fi
+  evidence:
+    needs: guard
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+    outputs:
+      gate_run: ${{ steps.gate.outputs.run_id }}
+      build_run: ${{ steps.build.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify publisher evidence run
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RUN: ${{ inputs.evidence_run_id }}
+        run: |
+          set -euo pipefail
+          source .github/release/common.sh
+          assert_reviewed
+          verify_workflow_run "$EVIDENCE_RUN" publish
+      - name: Verify binary build run
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          source .github/release/common.sh
+          assert_reviewed
+          verify_workflow_run "${BUILD_RUN:-$GITHUB_RUN_ID}" release
 
   build:
-    needs: release-info
-    if: needs.release-info.outputs.build == 'true'
+    needs: evidence
+    if: inputs.build_run_id == ''
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
+    env:
+      REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+      EVIDENCE_RUN: ${{ needs.evidence.outputs.gate_run }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             runner: macos-15
-            builder: cargo
           - target: x86_64-apple-darwin
             runner: macos-15-intel
-            builder: cargo
           - target: aarch64-unknown-linux-musl
             runner: ubicloud-standard-2
-            builder: cross
           - target: x86_64-unknown-linux-musl
             runner: ubicloud-standard-2
-            builder: cross
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          targets: ${{ matrix.target }}
-      - if: matrix.builder == 'cross'
-        name: Install cross
-        run: |
-          sudo systemctl start docker
-          cargo install cross --git https://github.com/cross-rs/cross --locked
-      - name: Build cargo-vip
-        env:
-          TARGET: ${{ matrix.target }}
-          BUILDER: ${{ matrix.builder }}
-        run: |
-          if [ "$BUILDER" = cross ]; then
-            cross build --release --target "$TARGET" --bin cargo-vip
-          else
-            cargo build --release --target "$TARGET" --bin cargo-vip
-          fi
-      - name: Reject native TLS and OpenSSL dependencies
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify reviewed checkout
         run: |
           set -euo pipefail
-          if grep -E '^name = "(openssl|openssl-sys|native-tls|rustls-native-certs|openssl-probe)"' Cargo.lock; then
-            echo "::error::an OpenSSL or system-trust-store crate entered the graph" >&2
-            exit 1
-          fi
-      - name: Package binary and checksum
+          source .github/release/common.sh
+          assert_reviewed
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crate-evidence-${{ github.sha }}
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.evidence.outputs.gate_run }}
+          path: ${{ runner.temp }}/crate-evidence
+      - name: Install reviewed Rust toolchain
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          set -euo pipefail
-          archive="cargo-vip-$TARGET.tar.gz"
-          mkdir -p staging/bin dist
-          install -m 755 "target/$TARGET/release/cargo-vip" staging/bin/cargo-vip
-          tar -C staging -czf "dist/$archive" bin/cargo-vip
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "$archive" > "$archive.sha256")
-          else
-            (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
-          fi
-      - uses: actions/upload-artifact@v4
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+      - name: Build from the retained lock and package target evidence
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/release/binary.sh build "$TARGET" "$RUNNER_TEMP/crate-evidence" "$RUNNER_TEMP/binary-evidence"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cargo-vip-${{ matrix.target }}
-          path: dist/*
+          name: binary-${{ github.sha }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/binary-evidence/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   publish:
-    needs: [release-info, build]
-    if: needs.release-info.outputs.build == 'true'
+    needs: [evidence, build]
+    if: >-
+      ${{ !cancelled() && needs.evidence.result == 'success' &&
+          (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.build_run_id != '')) }}
     runs-on: ubicloud-standard-2
+    timeout-minutes: 20
+    environment: release
     permissions:
+      actions: read
       contents: write
+    env:
+      REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+      EVIDENCE_RUN: ${{ needs.evidence.outputs.gate_run }}
+      BUILD_RUN: ${{ needs.evidence.outputs.build_run }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          path: dist
-          pattern: cargo-vip-*
-          merge-multiple: true
-      - name: Verify archives and checksums
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify reviewed checkout
         run: |
           set -euo pipefail
-          cd dist
-          for target in \
-            aarch64-apple-darwin \
-            x86_64-apple-darwin \
-            aarch64-unknown-linux-musl \
-            x86_64-unknown-linux-musl; do
-            archive="cargo-vip-$target.tar.gz"
-            sha256sum -c "$archive.sha256"
-            tar -tzf "$archive" | grep -qx 'bin/cargo-vip'
-          done
-      - uses: softprops/action-gh-release@v3
+          source .github/release/common.sh
+          assert_reviewed
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          tag_name: ${{ needs.release-info.outputs.tag }}
-          name: ${{ needs.release-info.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          token: ${{ github.token }}
+          name: crate-evidence-${{ github.sha }}
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.evidence.outputs.gate_run }}
+          path: ${{ runner.temp }}/crate-evidence
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-${{ github.sha }}-*
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.evidence.outputs.build_run }}
+          path: ${{ runner.temp }}/binaries
+      - name: Verify version-tag protection
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_RULESET_TOKEN }}
+        run: |
+          set -euo pipefail
+          source .github/release/common.sh
+          assert_reviewed
+          require_tag_protection
+      - name: Verify all target evidence and reconcile the exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: bash .github/release/binary.sh release "$RUNNER_TEMP/crate-evidence" "$RUNNER_TEMP/binaries"
