@@ -279,10 +279,14 @@ fn load_file_config() -> Result<FileConfig> {
         return Ok(FileConfig::default());
     };
     match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+        Ok(text) => parse_credentials_file(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileConfig::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+fn parse_credentials_file(text: &str) -> Result<FileConfig> {
+    toml::from_str(text).map_err(|_| anyhow::anyhow!("could not parse credentials file"))
 }
 
 /// Decide where credentials come from.
@@ -414,8 +418,8 @@ fn is_crates_vip_index(index: &str) -> bool {
 }
 
 fn registries_in_toml(text: &str, origin_label: &str) -> Result<Vec<(String, String)>> {
-    let config: toml::Value =
-        toml::from_str(text).with_context(|| format!("parsing Cargo config {origin_label}"))?;
+    let config: toml::Value = toml::from_str(text)
+        .map_err(|_| anyhow::anyhow!("parsing Cargo config {origin_label}: invalid TOML"))?;
     let Some(registries) = config.get("registries").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
     };
@@ -476,7 +480,10 @@ fn discover_registries(
             .strip_prefix("CARGO_REGISTRIES_")
             .and_then(|s| s.strip_suffix("_INDEX"))
         {
-            if !is_crates_vip_index(value) {
+            if upper == "VIP" && !is_crates_vip_index(value) {
+                // Every alias of this environment key has the same non-private index.
+                found.retain(|name, _| index_env(name) != key.as_str());
+                found.insert("vip".to_owned(), value.clone());
                 continue;
             }
             if let Some(name) = found
@@ -492,7 +499,8 @@ fn discover_registries(
     }
     Ok(found
         .into_iter()
-        .filter(|(_, index)| is_crates_vip_index(index))
+        // Keep an excluded default-name override so planning cannot recreate it.
+        .filter(|(name, index)| name == "vip" || is_crates_vip_index(index))
         .collect())
 }
 
@@ -503,17 +511,29 @@ fn select_active_registries(
     discovered: &[(String, String)],
     is_publish: bool,
 ) -> Result<ActiveRegistryPlan> {
-    let indexes: BTreeMap<_, _> = discovered.iter().cloned().collect();
+    let excluded_default = discovered
+        .iter()
+        .any(|(name, index)| name == "vip" && !is_crates_vip_index(index));
+    let eligible: Vec<_> = discovered
+        .iter()
+        .filter(|(_, index)| is_crates_vip_index(index))
+        .cloned()
+        .collect();
+    let indexes: BTreeMap<_, _> = eligible.iter().cloned().collect();
     if is_publish {
         if explicit.len() > 1 {
             bail!("cargo vip publish takes a single --registry");
         }
         let target = if let Some(name) = explicit.first() {
             name.clone()
-        } else if discovered.is_empty() || discovered.iter().any(|(name, _)| name == "vip") {
+        } else if excluded_default && eligible.is_empty() {
+            bail!(
+                "the default registry index is overridden by a non-crates.vip URL; pass --registry <NAME> to select a private registry explicitly"
+            );
+        } else if eligible.is_empty() || eligible.iter().any(|(name, _)| name == "vip") {
             "vip".to_owned()
-        } else if discovered.len() == 1 {
-            discovered[0].0.clone()
+        } else if eligible.len() == 1 {
+            eligible[0].0.clone()
         } else {
             bail!(
                 "multiple registries configured; pass --registry <NAME> to select which registry to publish to"
@@ -521,7 +541,7 @@ fn select_active_registries(
         };
         let mut active = vec![(target.clone(), indexes.get(&target).cloned())];
         active.extend(
-            discovered
+            eligible
                 .iter()
                 .filter(|(name, _)| name != &target)
                 .map(|(name, index)| (name.clone(), Some(index.clone()))),
@@ -535,14 +555,17 @@ fn select_active_registries(
                 .collect(),
             None,
         ))
-    } else if !discovered.is_empty() {
+    } else if !eligible.is_empty() {
         Ok((
-            discovered
+            eligible
                 .iter()
                 .map(|(name, index)| (name.clone(), Some(index.clone())))
                 .collect(),
             None,
         ))
+    } else if excluded_default {
+        // Cargo already has an effective non-private VIP index; leave it alone.
+        Ok((Vec::new(), None))
     } else {
         Ok((vec![("vip".to_owned(), None)], None))
     }
@@ -662,7 +685,11 @@ fn resolve_registry_with(
         }
         if let Some(entry) = file.find_by_bucket(bucket) {
             let (broker, token) = saved_broker_pair(file, entry.broker.as_deref(), &entry.token)?;
-            return exchange(&broker, &token);
+            let resolved = exchange(&broker, &token)?;
+            if resolved.bucket != bucket {
+                bail!("the saved token did not resolve to its configured registry bucket");
+            }
+            return Ok(resolved);
         }
         if let Some(token) = &file.token {
             let (broker, token) = saved_broker_pair(file, None, token)?;
@@ -782,7 +809,7 @@ fn registry_index_in_file(path: &Path, registry: &str) -> Result<Option<String>>
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
     let config: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("parsing Cargo config {}", path.display()))?;
+        .map_err(|_| anyhow::anyhow!("parsing Cargo config {}: invalid TOML", path.display()))?;
     let Some(registries) = config.get("registries") else {
         return Ok(None);
     };
@@ -807,9 +834,9 @@ fn bucket_from_index(index: &str, registry: &str) -> Result<Option<String>> {
     let url = index.strip_prefix("sparse+").unwrap_or(index);
     let (scheme, rest) = url
         .split_once("://")
-        .with_context(|| format!("registry {registry:?} index {index:?} is not a URL"))?;
+        .with_context(|| format!("registry {registry:?} index is not a URL"))?;
     if scheme != "https" && scheme != "http" {
-        bail!("registry {registry:?} index {index:?} must use HTTP or HTTPS");
+        bail!("registry {registry:?} index must use HTTP or HTTPS");
     }
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let host = authority
@@ -821,7 +848,7 @@ fn bucket_from_index(index: &str, registry: &str) -> Result<Option<String>> {
         .unwrap_or_default();
     if !host.eq_ignore_ascii_case("crates.vip") {
         bail!(
-            "registry {registry:?} index {index:?} is not a crates.vip index URL of the form \
+            "registry {registry:?} index is not a crates.vip index URL of the form \
              sparse+https://crates.vip/<bucket>/"
         );
     }
@@ -831,7 +858,7 @@ fn bucket_from_index(index: &str, registry: &str) -> Result<Option<String>> {
         .find(|part| !part.is_empty())
         .unwrap_or_default();
     if bucket.is_empty() {
-        bail!("registry {registry:?} index {index:?} does not name a bucket");
+        bail!("registry {registry:?} index does not name a bucket");
     }
     // `crates.vip/index/` is the name-only placeholder repositories declared before
     // tokens were kept per bucket. It names no bucket, so the token decides.
@@ -1002,17 +1029,17 @@ where
 {
     use futures_util::StreamExt;
     while let Some(message) = socket.next().await {
-        match message.context("reading from the registry")? {
+        match message.map_err(|_| anyhow::anyhow!("reading from the registry failed"))? {
             tokio_tungstenite::tungstenite::Message::Text(text) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(&text).context("the registry sent invalid JSON")?;
-                if let Some(error) = value.get("error") {
-                    bail!("the registry refused: {error}");
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| anyhow::anyhow!("the registry sent invalid JSON"))?;
+                if value.get("error").is_some() {
+                    bail!("the registry refused the credential request");
                 }
                 return Ok(value);
             }
-            tokio_tungstenite::tungstenite::Message::Close(frame) => {
-                bail!("the registry closed the connection: {frame:?}");
+            tokio_tungstenite::tungstenite::Message::Close(_) => {
+                bail!("the registry closed the connection");
             }
             _ => {}
         }
@@ -1323,7 +1350,7 @@ async fn start_proxies(
                 resolved
                     .endpoint
                     .parse()
-                    .with_context(|| format!("parsing {}", resolved.endpoint))?,
+                    .context("parsing the object-store endpoint")?,
                 UrlStyle::Path,
                 resolved.bucket,
                 resolved.region,
@@ -1783,12 +1810,14 @@ fn reply(status: StatusCode, content_type: &str, body: impl Into<String>) -> Res
 mod tests {
     use super::{
         Args, FileConfig, Registry, RegistryToken, Resolved, Source, bucket_from_index,
-        can_skip_registry, find_registry_index, finish_registry_resolution, missing_token_message,
-        persist_credentials, resolve_registry_with, save_registry_token, saved_broker_pair,
-        select_active_registries, source, valid_download_components, valid_sparse_index_key,
-        wanted_broker_tokens,
+        can_skip_registry, discover_registries, find_registry_index, finish_registry_resolution,
+        missing_token_message, parse_credentials_file, persist_credentials, resolve_registry_with,
+        save_registry_token, saved_broker_pair, select_active_registries, source,
+        valid_download_components, valid_sparse_index_key, wanted_broker_tokens,
     };
+    use clap::CommandFactory;
     use std::collections::BTreeMap;
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1809,11 +1838,16 @@ mod tests {
     }
 
     fn test_directory() -> PathBuf {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is after the Unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("cargo-vip-test-{}-{nonce}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "cargo-vip-test-{}-{nonce}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[cfg(unix)]
@@ -1920,6 +1954,17 @@ mod tests {
             toml::from_str("broker = \"wss://old.example\"\ntoken = \"old-token\"\n").unwrap();
         assert_eq!(file.token.as_deref(), Some("old-token"));
         assert!(file.registry.is_empty());
+    }
+
+    #[test]
+    fn credential_parse_diagnostic_does_not_echo_input() {
+        let marker = "synthetic-secret-marker";
+        let error = parse_credentials_file(&format!("token = \"{marker}\n"))
+            .err()
+            .expect("malformed credentials must fail");
+        let error = format!("{error:#}");
+        assert_eq!(error, "could not parse credentials file");
+        assert!(!error.contains(marker));
     }
 
     fn saved_broker_resolved(args: &Args, token: &str, bucket: &str) -> Resolved {
@@ -2368,11 +2413,11 @@ mod tests {
         assert_eq!(explicit_calls, 1);
 
         let mut static_args = args;
-        static_args.bucket = Some("alpha".into());
+        static_args.bucket = Some("alternate".into());
         static_args.key_id = Some("static-id".into());
         static_args.key_secret = Some("static-secret".into());
-        let mut static_calls = 0;
-        let static_result = resolve_registry_with(
+        let mut cache = BTreeMap::new();
+        let static_result = finish_registry_resolution(
             &static_args,
             &file,
             "alpha",
@@ -2380,14 +2425,16 @@ mod tests {
             &[],
             None,
             1,
-            |_, _| {
-                static_calls += 1;
-                unreachable!("static keys bypass exchange")
-            },
+            false,
+            Ok(Vec::new()),
+            Vec::new(),
+            &mut cache,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(static_result.key_id, "static-id");
-        assert_eq!(static_calls, 0);
+        assert_eq!(static_result.bucket, "alternate");
+        assert!(cache.is_empty());
     }
 
     #[test]
@@ -2647,6 +2694,269 @@ mod tests {
             ]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_config_parse_diagnostic_does_not_echo_malformed_index_line() {
+        let marker = "synthetic-index-userinfo-marker";
+        let text = format!("[registries.vip]\nindex = \"https://{marker}@crates.vip/private/\n");
+        let error = super::registries_in_toml(&text, "synthetic config").unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("synthetic config"));
+        assert!(error.contains("invalid TOML"));
+        assert!(!error.contains(marker));
+
+        let root = test_directory();
+        fs::create_dir(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, &text).unwrap();
+        let result = super::registry_index_in_file(&path, "vip");
+        fs::remove_dir_all(root).unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert_eq!(
+            error,
+            format!("parsing Cargo config {}: invalid TOML", path.display())
+        );
+        assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn saved_bucket_mismatch_diagnostic_is_safe() {
+        let args = args();
+        let mut file = FileConfig::default();
+        super::save_registry_token(&mut file, "expected", "saved-token", "wss://issuer.example");
+        let pair = ("wss://issuer.example".to_owned(), "saved-token".to_owned());
+        let mut cache = BTreeMap::from([(
+            pair.clone(),
+            super::Resolved {
+                key_id: "id".into(),
+                key_secret: "secret".into(),
+                bucket: "wrong-bucket".into(),
+                endpoint: args.endpoint.clone(),
+                region: args.region.clone(),
+            },
+        )]);
+        let error = super::finish_registry_resolution(
+            &args,
+            &file,
+            "vip",
+            Some("sparse+https://crates.vip/expected/"),
+            &[],
+            None,
+            2,
+            false,
+            Ok(vec![pair.clone()]),
+            Vec::new(),
+            &mut cache,
+        )
+        .err()
+        .expect("saved bucket mismatch must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("configured registry bucket"));
+        assert!(!error.contains("saved-token"));
+
+        let fresh = saved_broker_resolved(&args, "saved-token", "wrong-bucket");
+        let error = finish_registry_resolution(
+            &args,
+            &file,
+            "vip",
+            Some("sparse+https://crates.vip/expected/"),
+            &[],
+            None,
+            2,
+            false,
+            Ok(vec![pair.clone()]),
+            vec![(pair.clone(), Ok(fresh))],
+            &mut BTreeMap::new(),
+        )
+        .err()
+        .expect("fresh bucket mismatch must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("configured registry bucket"));
+        assert!(!error.contains("saved-token"));
+
+        let optional = finish_registry_resolution(
+            &args,
+            &file,
+            "vip",
+            Some("sparse+https://crates.vip/expected/"),
+            &[],
+            None,
+            2,
+            can_skip_registry(true, true, Some("target"), "vip"),
+            Ok(vec![pair]),
+            Vec::new(),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(optional.is_none());
+    }
+
+    #[test]
+    fn help_hides_credential_environment_values_in_metadata() {
+        let mut command = Args::command();
+        for (name, env) in [
+            ("key_id", "CARGO_VIP_KEY_ID"),
+            ("key_secret", "CARGO_VIP_KEY_SECRET"),
+            ("token", "CARGO_VIP_TOKEN"),
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == name)
+                .expect("credential argument exists");
+            assert_eq!(arg.get_env(), Some(OsStr::new(env)));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "{name} must hide its environment value"
+            );
+        }
+        let help = command.render_long_help().to_string();
+        for env in [
+            "CARGO_VIP_TOKEN",
+            "CARGO_VIP_KEY_SECRET",
+            "CARGO_VIP_BUILD_DRIVER",
+        ] {
+            assert!(help.contains(env), "help must name {env}");
+        }
+    }
+
+    #[test]
+    fn broker_error_diagnostic_does_not_echo_peer_payload() {
+        let marker = "synthetic-peer-secret-marker";
+        let mut stream =
+            futures_util::stream::iter([Ok::<_, tokio_tungstenite::tungstenite::Error>(
+                tokio_tungstenite::tungstenite::Message::Text(
+                    format!(r#"{{"error":"{marker}"}}"#).into(),
+                ),
+            )]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(super::next_json(&mut stream)).unwrap_err();
+        let error = format!("{error:#}");
+        assert_eq!(error, "the registry refused the credential request");
+        assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn registry_index_errors_do_not_echo_the_index_url() {
+        let marker = "synthetic-index-secret-marker";
+        let error = bucket_from_index(&format!("https://{marker}.example/private/"), "upstream")
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("not a crates.vip index URL"));
+        assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn broker_close_reason_is_not_disclosed() {
+        let reason = "synthetic-peer-close-secret";
+        let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
+            reason: reason.into(),
+        };
+        let mut stream =
+            futures_util::stream::iter([Ok::<_, tokio_tungstenite::tungstenite::Error>(
+                tokio_tungstenite::tungstenite::Message::Close(Some(frame)),
+            )]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(super::next_json(&mut stream))
+            .err()
+            .expect("close frame must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("closed the connection"));
+        assert!(!error.contains(reason));
+    }
+
+    #[test]
+    fn non_vip_environment_override_removes_a_non_default_registry() {
+        let root = test_directory();
+        let cargo = root.join(".cargo");
+        fs::create_dir_all(&cargo).unwrap();
+        fs::write(
+            cargo.join("config.toml"),
+            "[registries.upstream]\nindex = \"sparse+https://crates.vip/private/\"\n",
+        )
+        .unwrap();
+        let env = vec![(
+            "CARGO_REGISTRIES_UPSTREAM_INDEX".to_owned(),
+            "sparse+https://example.com/replacement/".to_owned(),
+        )];
+        let found = discover_registries(&root, None, &env).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn non_vip_default_override_is_not_recreated_by_planning() {
+        let root = test_directory();
+        let cargo = root.join(".cargo");
+        fs::create_dir_all(&cargo).unwrap();
+        let path = cargo.join("config.toml");
+        let lowercase = "[registries.vip]\nindex = \"sparse+https://crates.vip/configured/\"\n";
+        let uppercase = "[registries.VIP]\nindex = \"sparse+https://crates.vip/alias/\"\n";
+        let upstream = "[registries.upstream]\nindex = \"sparse+https://crates.vip/upstream/\"\n";
+        let external = "sparse+https://example.com/replacement/";
+        let stable = "sparse+https://crates.vip/upstream/";
+        let loopback = "sparse+http://127.0.0.1:12345/";
+        let env = vec![("CARGO_REGISTRIES_VIP_INDEX".to_owned(), external.to_owned())];
+
+        for (config, mixed) in [
+            (lowercase.to_owned(), false),
+            (uppercase.to_owned(), false),
+            (format!("{uppercase}{lowercase}"), false),
+            (format!("{uppercase}{lowercase}{upstream}"), true),
+        ] {
+            fs::write(&path, config).unwrap();
+            let found = discover_registries(&root, None, &env).unwrap();
+            let mut expected = Vec::new();
+            if mixed {
+                expected.push(("upstream".to_owned(), stable.to_owned()));
+            }
+            expected.push(("vip".to_owned(), external.to_owned()));
+            assert_eq!(found, expected);
+
+            let (active, target) = select_active_registries(&[], &found, false).unwrap();
+            assert!(target.is_none());
+            let triples: Vec<_> = active
+                .into_iter()
+                .map(|(name, index)| (name, index.unwrap(), loopback.to_owned()))
+                .collect();
+            let config = super::cargo_config_all(&triples);
+            let overrides = super::cargo_env_all(&triples);
+            let publish = select_active_registries(&[], &found, true);
+            if mixed {
+                assert_eq!(config, super::cargo_config("upstream", stable, loopback));
+                assert_eq!(
+                    overrides,
+                    vec![(
+                        "CARGO_REGISTRIES_UPSTREAM_INDEX".to_owned(),
+                        loopback.to_owned()
+                    )]
+                );
+                assert_eq!(publish.unwrap().1.as_deref(), Some("upstream"));
+            } else {
+                assert!(config.is_empty());
+                assert!(overrides.is_empty());
+                assert!(publish.is_err());
+            }
+            let (explicit, _) =
+                select_active_registries(&["vip".to_owned()], &found, false).unwrap();
+            assert_eq!(explicit, vec![("vip".to_owned(), None)]);
+        }
+
+        fs::write(
+            &path,
+            format!("[registries.vip]\nindex = \"{external}\"\n{upstream}"),
+        )
+        .unwrap();
+        let found = discover_registries(&root, None, &[]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        let (_, target) = select_active_registries(&[], &found, true).unwrap();
+        assert_eq!(target.as_deref(), Some("upstream"));
     }
 
     #[test]

@@ -31,8 +31,9 @@ credential.
 - **Tigris has no STS.** Access keys are long-lived, so fetching per run buys no expiry.
   What it buys is that the long-lived key never reaches disk. Do not add an on-disk
   cache for broker-issued keys.
-- **No publish path.** This is the read side. Publishing is two S3 writes a CI job does
-  with the AWS CLI.
+- **Publishing is an explicit, allowlisted path.** cargo vip publish writes the crate tarball
+  and sparse-index entry to the selected private S3-compatible registry. Keep its registry
+  and package allowlists, immutable tarball condition, and index compare-and-swap behavior.
 
 ## Build & run
 
