@@ -1,6 +1,7 @@
 [package]
 name = "cargo-vip"
 version = "0.2.3"
+publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
