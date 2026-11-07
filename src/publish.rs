@@ -207,12 +207,12 @@ async fn put(
         .body(body)
         .send()
         .await
-        .with_context(|| format!("writing {key}"))?;
+        .map_err(|_| anyhow::anyhow!("writing object: request failed"))?;
     let status = res.status().as_u16();
     if status == PRECONDITION_FAILED || res.status().is_success() {
         return Ok(status);
     }
-    bail!("writing {key}: the bucket answered HTTP {status}")
+    bail!("writing object: the bucket answered HTTP {status}")
 }
 
 /// The object and its `ETag`, or empty and `None` when there is none yet.
@@ -223,19 +223,27 @@ async fn get(target: &Target<'_>, key: &str) -> Result<(String, Option<String>)>
         .get(url)
         .send()
         .await
-        .with_context(|| format!("reading {key}"))?;
+        .map_err(|_| anyhow::anyhow!("reading registry index: request failed"))?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok((String::new(), None));
     }
-    let res = res
-        .error_for_status()
-        .with_context(|| format!("reading {key}"))?;
+    let status = res.status();
+    let res = res.error_for_status().map_err(|_| {
+        anyhow::anyhow!(
+            "reading registry index: the bucket answered HTTP {}",
+            status.as_u16()
+        )
+    })?;
     let etag = res
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
-    Ok((res.text().await?, etag))
+    let body = res
+        .text()
+        .await
+        .map_err(|_| anyhow::anyhow!("reading registry index response body: request failed"))?;
+    Ok((body, etag))
 }
 
 /// Cargo's sparse-index path for a crate name.
