@@ -31,7 +31,8 @@ cargo ──▶ 127.0.0.1  ──signed GET──▶  bucket        (index, kilo
 
 Access is exactly what your key is scoped to. Grant someone a read-only key for
 one bucket or prefix and that is what they get; revoke the key and they are out.
-There is no shared token and nothing to leak in a URL.
+There is no shared token. Tarball downloads use short-lived presigned URLs;
+treat them as credentials while valid.
 
 ## Setup
 
