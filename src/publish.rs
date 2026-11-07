@@ -115,7 +115,7 @@ pub async fn publish(target: &Target<'_>, req: &Request, config: &[String]) -> R
         package.version,
         target.bucket.name()
     );
-    let key = crate::Registry::crate_key(&package.name, &package.version, &cksum);
+    let key = crate::proxy::Registry::crate_key(&package.name, &package.version, &cksum);
     let status = put(
         target,
         &key,
