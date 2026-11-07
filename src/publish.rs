@@ -1,7 +1,7 @@
 //! `cargo vip publish`: package a crate and add it to the registry.
 //!
 //! Publishing is two writes to the bucket, with the same protocol as the
-//! registry's own publisher (crates.vip-backend `crates-vip-index`):
+//! registry publisher:
 //!
 //! | Object | Precondition | Meaning |
 //! |---|---|---|
