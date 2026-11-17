@@ -59,7 +59,7 @@ pub(super) struct Args {
     #[arg(long)]
     pub(super) serve: bool,
 
-    /// Run this executable for `build` or `check` instead of Cargo.
+    /// Run this executable for `build`, `check`, or `plan` instead of Cargo.
     ///
     /// The driver receives the original Cargo arguments and registry configuration in
     /// `CARGO_VIP_CARGO_CONFIG_JSON`. `CARGO_VIP_BUILD_DRIVER` is the environment equivalent.
@@ -88,12 +88,53 @@ pub(super) fn validate_build_driver_request(args: &Args) -> Result<()> {
         bail!("--build-driver cannot be combined with --serve");
     }
     match args.cargo_args.first().map(String::as_str) {
-        Some("build" | "check") => Ok(()),
+        Some("build" | "check" | "plan") => Ok(()),
         Some(command) => {
-            bail!("--build-driver supports only `build` and `check`; `{command}` is unsupported")
+            bail!(
+                "--build-driver supports only `build`, `check`, and `plan`; `{command}` is unsupported"
+            )
         }
-        None => bail!("--build-driver needs a `build` or `check` command"),
+        None => bail!("--build-driver needs a `build`, `check`, or `plan` command"),
     }
+}
+
+/// If `--manifest-path` appears in `cargo_args`, return its parent directory so `.cargo/config.toml`
+/// discovery walks up from the target workspace when `cargo vip` is invoked from elsewhere.
+pub(super) fn manifest_parent_dir(cargo_args: &[String]) -> Option<PathBuf> {
+    let mut iter = cargo_args.iter().take_while(|arg| arg.as_str() != "--");
+    while let Some(arg) = iter.next() {
+        if arg == "--manifest-path" {
+            let path = PathBuf::from(iter.next()?);
+            let resolved = path.canonicalize().unwrap_or(path);
+            return resolved.parent().map(std::path::Path::to_path_buf);
+        }
+        if let Some(raw) = arg.strip_prefix("--manifest-path=") {
+            let path = PathBuf::from(raw);
+            let resolved = path.canonicalize().unwrap_or(path);
+            return resolved.parent().map(std::path::Path::to_path_buf);
+        }
+    }
+    None
+}
+/// True when Cargo is explicitly instructed not to contact network registries (`--offline` / `--frozen`)
+/// and this invocation is not `serve`, `env`, or `publish`.
+pub(super) fn is_offline_cargo_invocation(args: &Args) -> bool {
+    if args.serve {
+        return false;
+    }
+    if matches!(
+        args.cargo_args.first().map(String::as_str),
+        None | Some("login" | "publish" | "env")
+    ) {
+        return false;
+    }
+    let has_offline_flag = args
+        .cargo_args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--offline" | "--frozen"));
+    let env_offline = std::env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true" || v == "1");
+    has_offline_flag || env_offline
 }
 
 /// The `--config` arguments that point cargo at this process: the registry

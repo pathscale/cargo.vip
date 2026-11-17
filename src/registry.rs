@@ -478,8 +478,7 @@ pub(super) fn missing_token_message(bucket: &str) -> String {
 /// Resolve Cargo's index for this registry. Cargo-specific environment
 /// settings override the nearest project config; `CARGO_HOME` is the final file
 /// fallback just as it is for Cargo.
-fn cargo_registry_index(registry: &str) -> Result<Option<String>> {
-    let cwd = std::env::current_dir().context("getting the current directory")?;
+fn cargo_registry_index(registry: &str, cwd: &Path) -> Result<Option<String>> {
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
@@ -487,7 +486,7 @@ fn cargo_registry_index(registry: &str) -> Result<Option<String>> {
         std::env::var_os(index_env(registry)).map(|index| index.to_string_lossy().into_owned());
     find_registry_index(
         registry,
-        &cwd,
+        cwd,
         cargo_home.as_deref(),
         environment_index.as_deref(),
     )
@@ -657,7 +656,11 @@ pub(super) async fn resolve_active_registries(
     file: &FileConfig,
 ) -> Result<(Vec<(String, Resolved)>, Option<String>)> {
     let is_publish = args.cargo_args.first().is_some_and(|arg| arg == "publish");
-    let cwd = std::env::current_dir().context("getting the current directory")?;
+    let offline = crate::cli::is_offline_cargo_invocation(args);
+    let cwd = match crate::cli::manifest_parent_dir(&args.cargo_args) {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("getting the current directory")?,
+    };
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
@@ -669,14 +672,25 @@ pub(super) async fn resolve_active_registries(
         || args.key_secret.is_some()
         || file.key_id.is_some()
         || file.key_secret.is_some();
+    let candidates = collect_candidate_tokens(&args.token, |key| std::env::var(key).ok());
+    if offline
+        && !static_key
+        && candidates.is_empty()
+        && file.registry.is_empty()
+        && file.token.is_none()
+        && active
+            .iter()
+            .all(|(name, _)| std::env::var_os(token_env(name)).is_none())
+    {
+        return Ok((Vec::new(), publish_target));
+    }
     if !static_key {
         for (name, index) in &mut active {
             if index.is_none() {
-                *index = cargo_registry_index(name)?;
+                *index = cargo_registry_index(name, &cwd)?;
             }
         }
     }
-    let candidates = collect_candidate_tokens(&args.token, |key| std::env::var(key).ok());
     let mut cache: BTreeMap<(String, String), Resolved> = BTreeMap::new();
     let active_count = active.len();
     let mut result = Vec::new();

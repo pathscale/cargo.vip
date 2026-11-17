@@ -1,4 +1,3 @@
-
 use crate::broker::{self, Resolved};
 use crate::cli::{self, Args};
 use crate::config::{self, FileConfig, RegistryToken};
@@ -1394,4 +1393,145 @@ fn registry_index_uses_nearest_config_and_environment_override() {
         Some("sparse+https://crates.vip/global/")
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parses_package_ids_with_and_without_explicit_name_prefix() {
+    let named = crate::plan::parse_pkg_id(
+        "registry+https://github.com/rust-lang/crates.io-index#async-task@4.7.1",
+    )
+    .unwrap();
+    assert_eq!(named.name, "async-task");
+    assert_eq!(named.version, "4.7.1");
+
+    let path_inferred =
+        crate::plan::parse_pkg_id("path+file:///workspace/crates/my-pkg#0.2.5").unwrap();
+    assert_eq!(path_inferred.name, "my-pkg");
+    assert_eq!(path_inferred.version, "0.2.5");
+
+    let path_named =
+        crate::plan::parse_pkg_id("path+file:///workspace/bootstrap/core#custom-core@0.0.1")
+            .unwrap();
+    assert_eq!(path_named.name, "custom-core");
+    assert_eq!(path_named.version, "0.0.1");
+}
+
+#[test]
+fn emits_source_graphs_and_filters_language_root_edges() {
+    let root = test_directory();
+    let bootstrap = root.join("bootstrap");
+    let core_dir = bootstrap.join("core/src");
+    let alloc_dir = bootstrap.join("alloc/src");
+    let builtins_dir = bootstrap.join("compiler_builtins/src");
+    let app_dir = root.join("app/src");
+    for dir in [&core_dir, &alloc_dir, &builtins_dir, &app_dir] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("lib.rs"), "").unwrap();
+    }
+    let core_src = core_dir.join("lib.rs");
+    let alloc_src = alloc_dir.join("lib.rs");
+    let builtins_src = builtins_dir.join("lib.rs");
+    let app_src = app_dir.join("lib.rs");
+
+    let unit_graph = serde_json::json!({
+        "version": 1,
+        "roots": [3],
+        "units": [
+            {
+                "pkg_id": format!("path+file://{}#lang-core@0.0.1", bootstrap.join("core").display()),
+                "target": { "kind": ["lib"], "name": "core", "src_path": core_src, "edition": "2024" },
+                "profile": { "name": "dev", "opt_level": "0", "debug_assertions": true, "overflow_checks": true, "panic": "abort" },
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": []
+            },
+            {
+                "pkg_id": format!("path+file://{}#lang-builtins@0.0.1", bootstrap.join("compiler_builtins").display()),
+                "target": { "kind": ["lib"], "name": "compiler_builtins", "src_path": builtins_src, "edition": "2024" },
+                "profile": { "name": "dev", "opt_level": "0", "debug_assertions": true, "overflow_checks": true, "panic": "abort" },
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": [
+                    { "index": 0, "extern_crate_name": "core" }
+                ]
+            },
+            {
+                "pkg_id": format!("path+file://{}#lang-alloc@0.0.1", bootstrap.join("alloc").display()),
+                "target": { "kind": ["lib"], "name": "alloc", "src_path": alloc_src, "edition": "2024" },
+                "profile": { "name": "dev", "opt_level": "0", "debug_assertions": true, "overflow_checks": true, "panic": "abort" },
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": [
+                    { "index": 0, "extern_crate_name": "core" },
+                    { "index": 1, "extern_crate_name": "compiler_builtins" }
+                ]
+            },
+            {
+                "pkg_id": format!("path+file://{}#0.1.0", root.join("app").display()),
+                "target": { "kind": ["lib"], "name": "my-app", "src_path": app_src, "edition": "2021" },
+                "profile": { "name": "dev", "opt_level": "0", "debug_assertions": true, "overflow_checks": true, "panic": "abort" },
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": ["std-free"],
+                "dependencies": [
+                    { "index": 0, "extern_crate_name": "core" },
+                    { "index": 1, "extern_crate_name": "compiler_builtins" },
+                    { "index": 2, "extern_crate_name": "alloc" }
+                ]
+            }
+        ]
+    });
+    let out_dir = root.join("graphs");
+    let emitted = crate::plan::emit_source_graphs_from_json(
+        serde_json::to_vec(&unit_graph).unwrap().as_slice(),
+        true,
+        "aarch64-apple-darwin",
+        Some(&bootstrap),
+        &out_dir,
+    )
+    .unwrap();
+    // Units 0 (core) and 2 (alloc) are language units and skipped as roots; 1 and 3 are emitted.
+    assert_eq!(emitted.len(), 2);
+    let app_graph: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("unit-3.source-graph.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(app_graph["schema"], "eko.source-graph/1");
+    assert_eq!(app_graph["root"], "unit-3");
+    assert_eq!(app_graph["language_roots"].as_array().unwrap().len(), 2);
+    let edges = app_graph["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from"], "unit-3");
+    assert_eq!(edges[0]["to"], "unit-1");
+    assert_eq!(edges[0]["extern_name"], "compiler_builtins");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn offline_detection_and_plan_argument_split_preserve_cargo_flags() {
+    let mut offline_args = args();
+    offline_args.cargo_args = vec![
+        "plan".into(),
+        "--offline".into(),
+        "-p".into(),
+        "demo".into(),
+        "--emit-source-graph".into(),
+        "/tmp/graphs".into(),
+        "--every-unit-root".into(),
+        "--opt-level".into(),
+        "O2".into(),
+    ];
+    assert!(cli::is_offline_cargo_invocation(&offline_args));
+    let parsed = crate::plan::parse_plan_request(&offline_args.cargo_args[1..]).unwrap();
+    assert!(parsed.every_unit_root);
+    assert_eq!(parsed.opt_level.as_deref(), Some("O2"));
+    assert_eq!(parsed.cargo_build_args, vec!["--offline", "-p", "demo"]);
+
+    let mut online_publish = args();
+    online_publish.cargo_args = vec!["publish".into(), "--dry-run".into()];
+    assert!(!cli::is_offline_cargo_invocation(&online_publish));
 }

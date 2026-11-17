@@ -1,6 +1,6 @@
 [package]
 name = "cargo-vip"
-version = "0.2.3"
+version = "0.2.4"
 publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"

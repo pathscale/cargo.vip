@@ -22,6 +22,7 @@
 mod broker;
 mod cli;
 mod config;
+mod plan;
 mod proxy;
 mod publish;
 mod registry;
@@ -39,6 +40,15 @@ async fn main() -> Result<()> {
 
     let args = cli::parse_args();
     cli::validate_build_driver_request(&args)?;
+    let plan_request =
+        if args.build_driver.is_none() && args.cargo_args.first().is_some_and(|a| a == "plan") {
+            if args.serve {
+                bail!("`cargo vip plan` cannot be combined with --serve");
+            }
+            Some(plan::parse_plan_request(&args.cargo_args[1..])?)
+        } else {
+            None
+        };
     let file = config::load_file_config()?;
 
     if args.cargo_args.first().is_some_and(|a| a == "login") {
@@ -80,6 +90,13 @@ async fn main() -> Result<()> {
     }
     if args.cargo_args.is_empty() {
         bail!("nothing to run: try `cargo vip build`, or --serve to stay in the foreground");
+    }
+    if let Some(request) = &plan_request {
+        let outcome = plan::execute_plan(&args, request, &config, envs).await;
+        for task in serving {
+            task.abort();
+        }
+        return outcome;
     }
     if args.cargo_args.first().is_some_and(|a| a == "publish") {
         let target_name = publish_target.as_deref().unwrap_or("vip");

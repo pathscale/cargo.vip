@@ -65,7 +65,7 @@ cargo vip update
 
 ### Using a build driver
 
-For `build` and `check`, you can select an executable to receive the Cargo arguments while
+For `build`, `check`, and `plan`, you can select an executable to receive the Cargo arguments while
 `cargo.vip` keeps the registry proxies active:
 
 ```sh
@@ -83,9 +83,27 @@ environment, which may include exported credentials. The driver's numeric exit c
 `cargo vip` exit code. If no numeric code is available, such as when a signal terminates the
 driver on Unix, `cargo vip` exits with code 1.
 
-Selecting a build driver supports only `build` and `check`; `test`, `publish`, `login`, `env`,
-and other commands fail with an error instead of falling back to Cargo. Without a selected
+Selecting a build driver supports only `build`, `check`, and `plan`; `test`, `publish`, `login`,
+`env`, and other commands fail with an error instead of falling back to Cargo. Without a selected
 driver, the existing Cargo invocation is unchanged.
+
+### Source-graph planning
+
+`cargo vip plan` resolves Cargo's unit graph (`build -Z unstable-options --unit-graph`) without
+starting a full compilation and optionally writes `eko.source-graph/1` JSON closures or forwards
+them sequentially to a resident compiler client:
+
+```sh
+cargo vip plan --offline --manifest-path Cargo.toml -p my-crate \
+  --target aarch64-apple-darwin \
+  --emit-source-graph ./graphs --every-unit-root
+```
+
+Additional `plan` options (`--language-roots <DIR>`, `--opt-level <O0..O3|Os|Oz|Ofast>`,
+`--compile-with <CLIENT>`, `--socket <SOCK>`, `--out-dir <DIR>`, `--timing`) are consumed by
+`cargo vip plan`; all remaining flags are forwarded to Cargo's unit-graph query. When `--offline`
+or `--frozen` is passed and no registry credentials are configured, `cargo vip` skips broker
+credential exchange so local/offline builds and plans work without stored tokens.
 
 With one saved token, the wrapper can select it without a registry index in
 Cargo config. When you have tokens for multiple products, add an index entry to
